@@ -1,0 +1,25 @@
+# Go
+jar-fucker
+*.exe
+*.test
+*.out
+
+# Build
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project - CFR downloaded jars
+/cfr/
+output/
+*_decompiled/
+*_extracted/

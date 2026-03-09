@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jar-Fucker — JAR 反编译工具</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Title Bar -->
+    <header id="titlebar">
+      <div class="titlebar-left">
+        <span class="logo">☕ Jar-Fucker</span>
+      </div>
+      <div class="titlebar-center">
+        <div class="path-group">
+          <label>源目录</label>
+          <div class="path-input-group">
+            <input type="text" id="source-dir" placeholder="包含 JAR 的文件夹路径 (或直接拖拽到页面)" spellcheck="false">
+            <button id="btn-browse-source" title="浏览">📁</button>
+          </div>
+        </div>
+        <div class="path-group">
+          <label>输出目录</label>
+          <div class="path-input-group">
+            <input type="text" id="output-dir" placeholder="反编译结果输出路径 (留空自动生成)" spellcheck="false">
+            <button id="btn-browse-output" title="浏览">📁</button>
+          </div>
+        </div>
+      </div>
+      <div class="titlebar-right">
+        <button id="btn-scan" class="action-btn" title="扫描目录中的 JAR 文件">
+          ① 扫描
+        </button>
+        <button id="btn-decompile" class="action-btn primary" title="反编译所有已发现的 JAR" disabled>
+          ② 反编译
+        </button>
+        <button id="btn-settings" class="icon-btn" title="设置">⚙</button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main id="main-content">
+      <!-- Sidebar -->
+      <aside id="sidebar">
+        <!-- JAR List Section -->
+        <div class="sidebar-section" id="jar-list-section">
+          <div class="sidebar-header">
+            <span>JAR 列表</span>
+            <div class="sidebar-actions">
+              <button id="btn-select-all" class="icon-btn small" title="全选/取消全选">☑</button>
+              <span id="jar-count" class="badge">0</span>
+            </div>
+          </div>
+          <div id="jar-list">
+            <div class="empty-state small-empty">
+              <p>拖拽文件夹到页面或输入路径扫描</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Divider -->
+        <div class="sidebar-divider"></div>
+
+        <!-- File Tree / Search Section -->
+        <div class="sidebar-section" id="tree-section">
+          <div class="sidebar-header">
+            <span>反编译结果</span>
+            <div class="sidebar-actions">
+              <button id="btn-search-toggle" class="icon-btn small" title="搜索">🔍</button>
+            </div>
+          </div>
+          <div id="search-panel" class="hidden">
+            <div class="search-input-group">
+              <input type="text" id="search-keyword" placeholder="搜索关键词..." spellcheck="false">
+              <label class="search-option">
+                <input type="checkbox" id="search-ignore-case"> 忽略大小写
+              </label>
+            </div>
+            <button id="btn-search" class="action-btn small full-width">搜索</button>
+            <div id="search-results"></div>
+          </div>
+          <div id="file-tree">
+            <div class="empty-state small-empty">
+              <p>反编译后在此浏览源码</p>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Resizer -->
+      <div id="resizer"></div>
+
+      <!-- Editor Area -->
+      <section id="editor-area">
+        <div id="tab-bar"></div>
+        <div id="code-viewer">
+          <!-- Welcome / Drop Zone -->
+          <div id="drop-zone" class="welcome-screen">
+            <div class="drop-zone-inner">
+              <div class="drop-icon">📂</div>
+              <h1>拖拽文件夹到此处</h1>
+              <p>自动识别文件夹内所有 JAR 包</p>
+              <div class="drop-divider"><span>或</span></div>
+              <div class="welcome-steps">
+                <div class="step">
+                  <div class="step-num">1</div>
+                  <div class="step-text">在顶部输入包含 JAR 的文件夹路径，点击「扫描」</div>
+                </div>
+                <div class="step">
+                  <div class="step-num">2</div>
+                  <div class="step-text">确认 JAR 列表后，点击「反编译」</div>
+                </div>
+                <div class="step">
+                  <div class="step-num">3</div>
+                  <div class="step-text">在左侧文件树中浏览反编译的 Java 源码</div>
+                </div>
+              </div>
+              <div class="welcome-shortcut">
+                支持拖拽 <kbd>.jar</kbd> 文件 或 包含 JAR 的文件夹
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Status Bar -->
+    <footer id="statusbar">
+      <div class="status-left">
+        <span id="status-text">就绪 — 拖拽文件夹或输入路径开始</span>
+      </div>
+      <div class="status-right">
+        <span id="status-jar-info"></span>
+        <span id="status-file-info"></span>
+      </div>
+    </footer>
+
+    <!-- File Browser Modal -->
+    <div id="modal-browse" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content modal-large">
+        <div class="modal-header">
+          <h3 id="browse-title">选择文件夹</h3>
+          <button class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="browse-path-bar">
+            <button id="browse-up" title="上级目录">⬆</button>
+            <input type="text" id="browse-current-dir" spellcheck="false">
+            <button id="browse-go">前往</button>
+          </div>
+          <div id="browse-list" class="browse-list"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="browse-cancel" class="action-btn">取消</button>
+          <button id="browse-select-dir" class="action-btn primary">选择此目录</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="modal-settings" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>设置</h3>
+          <button class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>Java 路径</label>
+            <input type="text" id="setting-java-path" placeholder="自动检测" spellcheck="false">
+          </div>
+          <div class="form-group">
+            <label>CFR 路径</label>
+            <input type="text" id="setting-cfr-path" placeholder="自动下载" spellcheck="false">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="settings-save" class="action-btn primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="hidden">
+      <div class="loading-spinner"></div>
+      <p id="loading-text">处理中...</p>
+      <p id="loading-detail" class="loading-sub"></p>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+  </div>
+
+  <!-- Drag Overlay -->
+  <div id="drag-overlay" class="hidden">
+    <div class="drag-overlay-inner">
+      <div class="drag-overlay-icon">📂</div>
+      <p>释放以添加 JAR 文件</p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
