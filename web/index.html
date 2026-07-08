@@ -179,8 +179,8 @@
             <input type="text" id="setting-java-path" placeholder="自动检测" spellcheck="false">
           </div>
           <div class="form-group">
-            <label>CFR 路径</label>
-            <input type="text" id="setting-cfr-path" placeholder="自动下载" spellcheck="false">
+            <label>Fernflower 路径</label>
+            <input type="text" id="setting-cfr-path" placeholder="自动识别源码 zip / jar / 解压目录" spellcheck="false">
           </div>
         </div>
         <div class="modal-footer">
@@ -189,10 +189,31 @@
       </div>
     </div>
 
+    <!-- Task Log Modal -->
+    <div id="modal-log" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content modal-large">
+        <div class="modal-header">
+          <h3>任务日志</h3>
+          <button class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <pre id="task-log-content" class="task-log-content"></pre>
+        </div>
+        <div class="modal-footer">
+          <button id="task-log-close" class="action-btn primary">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Loading Overlay -->
     <div id="loading-overlay" class="hidden">
       <div class="loading-spinner"></div>
       <p id="loading-text">处理中...</p>
+      <div id="loading-progress" class="loading-progress hidden">
+        <div id="loading-progress-bar"></div>
+      </div>
+      <p id="loading-percent" class="loading-sub hidden">0%</p>
       <p id="loading-detail" class="loading-sub"></p>
     </div>
 

@@ -44,7 +44,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("  ╔═══════════════════════════════════════════╗")
 	fmt.Println("  ║          ☕ Jar-Fucker v1.0.0             ║")
-	fmt.Println("  ║      JAR 包提取 & CFR 反编译工具          ║")
+	fmt.Println("  ║   JAR 包提取 & Fernflower 反编译工具      ║")
 	fmt.Println("  ╠═══════════════════════════════════════════╣")
 	fmt.Printf("  ║  🌐 %-38s ║\n", url)
 	fmt.Println("  ║  按 Ctrl+C 退出                           ║")

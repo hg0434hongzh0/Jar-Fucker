@@ -8,6 +8,8 @@
     tabs: [],
     activeTab: null,
     browseTarget: null, // "source" | "output"
+    activeTask: null,
+    lastTaskLog: "",
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -40,6 +42,9 @@
     loadingOverlay: $("#loading-overlay"),
     loadingText: $("#loading-text"),
     loadingDetail: $("#loading-detail"),
+    loadingProgress: $("#loading-progress"),
+    loadingProgressBar: $("#loading-progress-bar"),
+    loadingPercent: $("#loading-percent"),
     toastContainer: $("#toast-container"),
     dragOverlay: $("#drag-overlay"),
     modalBrowse: $("#modal-browse"),
@@ -54,19 +59,28 @@
     settingJavaPath: $("#setting-java-path"),
     settingCfrPath: $("#setting-cfr-path"),
     settingsSave: $("#settings-save"),
+    modalLog: $("#modal-log"),
+    taskLogContent: $("#task-log-content"),
+    taskLogClose: $("#task-log-close"),
   };
 
   // ==================== API ====================
-  async function api(method, url, body) {
-    const opts = { method, headers: {} };
+  async function api(method, url, body, options = {}) {
+    const opts = { method, headers: {}, signal: options.signal };
     if (body) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
     }
     const res = await fetch(url, opts);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) throw taskError(data.error || `HTTP ${res.status}`, data.log || "");
     return data;
+  }
+
+  function taskError(message, log) {
+    const err = new Error(message);
+    err.log = log || "";
+    return err;
   }
 
   // ==================== Toast / Loading / Modal ====================
@@ -81,7 +95,27 @@
   function showLoading(text, detail) {
     els.loadingText.textContent = text;
     els.loadingDetail.textContent = detail || "";
+    setLoadingProgress(null);
     els.loadingOverlay.classList.remove("hidden");
+  }
+
+  function updateLoading(text, detail) {
+    if (text) els.loadingText.textContent = text;
+    els.loadingDetail.textContent = detail || "";
+  }
+
+  function setLoadingProgress(percent) {
+    if (percent === null || percent === undefined) {
+      els.loadingProgress.classList.add("hidden");
+      els.loadingPercent.classList.add("hidden");
+      els.loadingProgressBar.style.width = "0%";
+      return;
+    }
+    const value = Math.max(0, Math.min(100, Math.round(percent)));
+    els.loadingProgress.classList.remove("hidden");
+    els.loadingPercent.classList.remove("hidden");
+    els.loadingProgressBar.style.width = `${value}%`;
+    els.loadingPercent.textContent = `${value}%`;
   }
 
   function hideLoading() { els.loadingOverlay.classList.add("hidden"); }
@@ -97,6 +131,53 @@
   }
 
   function setStatus(t) { els.statusText.textContent = t; }
+
+  function showTaskLog(log) {
+    state.lastTaskLog = log || state.lastTaskLog || "暂无日志";
+    els.taskLogContent.textContent = state.lastTaskLog;
+    openModal(els.modalLog);
+  }
+
+  function showTaskError(prefix, err) {
+    state.lastTaskLog = err.log || "";
+    toast(`${prefix}: ${err.message}`, "error");
+    if (state.lastTaskLog) {
+      setStatus(`${prefix}，已打开任务日志`);
+      showTaskLog(state.lastTaskLog);
+    } else {
+      setStatus(prefix);
+    }
+  }
+
+  function startTask(label) {
+    cancelActiveTask(false);
+    const controller = new AbortController();
+    state.activeTask = { label, controller };
+    return controller;
+  }
+
+  function finishTask(controller) {
+    if (state.activeTask && state.activeTask.controller === controller) {
+      state.activeTask = null;
+    }
+  }
+
+  function cancelActiveTask(showMessage = true) {
+    if (!state.activeTask) return false;
+    const { label, controller } = state.activeTask;
+    controller.abort();
+    state.activeTask = null;
+    hideLoading();
+    setStatus(`${label}已取消`);
+    if (showMessage) toast(`${label}已取消`, "info");
+    els.btnScan.disabled = false;
+    els.btnDecompile.disabled = !state.jars.some((j) => j.checked);
+    return true;
+  }
+
+  function isAbortError(err) {
+    return err && err.name === "AbortError";
+  }
 
   // ==================== Drag & Drop ====================
   let dragCounter = 0;
@@ -129,42 +210,51 @@
 
   async function handleDrop(e) {
     const items = e.dataTransfer.items;
-    if (!items || items.length === 0) return;
+    const files = e.dataTransfer.files;
+    if ((!items || items.length === 0) && (!files || files.length === 0)) return;
 
-    showLoading("正在读取拖入的文件...", "扫描文件夹内容中");
+    const controller = startTask("拖拽导入");
+    const { signal } = controller;
+    showLoading("正在读取拖入的文件...", "扫描文件夹内容中，按 ESC 取消");
     const jarFiles = [];
 
     try {
-      for (let i = 0; i < items.length; i++) {
+      const seen = new Set();
+      for (const file of Array.from(files || [])) {
+        addJarFile(file, jarFiles, seen);
+      }
+
+      for (let i = 0; i < (items ? items.length : 0); i++) {
+        signal.throwIfAborted();
         const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
         if (entry) {
-          await collectJarEntries(entry, jarFiles);
+          await collectJarEntries(entry, jarFiles, seen, signal);
         } else {
           const file = e.dataTransfer.files[i];
-          if (file && file.name.toLowerCase().endsWith(".jar")) {
-            jarFiles.push(file);
-          }
+          addJarFile(file, jarFiles, seen);
         }
       }
 
       if (jarFiles.length === 0) {
         hideLoading();
+        finishTask(controller);
         toast("未发现任何 JAR 文件", "error");
         return;
       }
 
-      els.loadingText.textContent = `发现 ${jarFiles.length} 个 JAR 文件，正在上传...`;
+      updateLoading(`发现 ${jarFiles.length} 个 JAR 文件，正在上传...`, "按 ESC 取消");
 
       const formData = new FormData();
       for (const f of jarFiles) {
         formData.append("files", f);
       }
 
-      const res = await fetch("/api/upload", { method: "POST", body: formData });
+      const res = await fetch("/api/upload", { method: "POST", body: formData, signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
       hideLoading();
+      finishTask(controller);
 
       if (data.files && data.files.length > 0) {
         els.sourceDir.value = data.tempDir;
@@ -175,21 +265,35 @@
         toast("上传的文件中没有有效的 JAR", "error");
       }
     } catch (err) {
+      finishTask(controller);
       hideLoading();
+      if (isAbortError(err)) {
+        setStatus("拖拽导入已取消");
+        return;
+      }
       toast("处理拖入文件失败: " + err.message, "error");
     }
   }
 
-  async function collectJarEntries(entry, results) {
+  function addJarFile(file, results, seen) {
+    if (!file || !file.name || !file.name.toLowerCase().endsWith(".jar")) return;
+    const key = `${file.webkitRelativePath || file.name}:${file.size}:${file.lastModified}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    results.push(file);
+  }
+
+  async function collectJarEntries(entry, results, seen, signal) {
+    signal.throwIfAborted();
     if (entry.isFile) {
       if (entry.name.toLowerCase().endsWith(".jar")) {
         const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
-        results.push(file);
+        addJarFile(file, results, seen);
       }
     } else if (entry.isDirectory) {
       const entries = await readAllEntries(entry.createReader());
       for (const e of entries) {
-        await collectJarEntries(e, results);
+        await collectJarEntries(e, results, seen, signal);
       }
     }
   }
@@ -211,7 +315,7 @@
   function setJarList(jars) {
     state.jars = jars.map((j) => ({ ...j, checked: true }));
     renderJarList();
-    els.btnDecompile.disabled = false;
+    els.btnDecompile.disabled = state.jars.length === 0;
   }
 
   function renderJarList() {
@@ -279,16 +383,20 @@
       return;
     }
 
-    showLoading("正在扫描目录...", dir);
+    const controller = startTask("扫描");
+    showLoading("正在扫描目录...", `${dir}，按 ESC 取消`);
     setStatus("扫描中...");
 
     try {
-      const data = await api("POST", "/api/scan", { dir });
+      const data = await api("POST", "/api/scan", { dir }, { signal: controller.signal });
       hideLoading();
+      finishTask(controller);
 
       if (!data.jars || data.jars.length === 0) {
+        setJarList([]);
         toast("该目录中没有找到 JAR 文件", "error");
         setStatus("未找到 JAR 文件");
+        els.statusJarInfo.textContent = dir;
         return;
       }
 
@@ -297,7 +405,12 @@
       setStatus(`发现 ${data.total} 个 JAR 文件 — 点击「反编译」开始`);
       els.statusJarInfo.textContent = dir;
     } catch (e) {
+      finishTask(controller);
       hideLoading();
+      if (isAbortError(e)) {
+        setStatus("扫描已取消");
+        return;
+      }
       toast("扫描失败: " + e.message, "error");
       setStatus("扫描失败");
     }
@@ -315,22 +428,26 @@
     if (!outDir) {
       const srcDir = els.sourceDir.value.trim();
       if (srcDir) {
-        outDir = srcDir.replace(/\/$/, "") + "_decompiled";
+        outDir = buildDefaultOutputDir(srcDir);
       } else {
-        outDir = "/tmp/jar-fucker-output";
+        outDir = `/tmp/jar-fucker-output/${timestampForPath()}`;
       }
       els.outputDir.value = outDir;
     }
 
-    showLoading(`正在反编译 ${selected.length} 个 JAR 文件...`, "这可能需要一些时间");
+    const controller = startTask("反编译");
+    showLoading(`正在反编译 ${selected.length} 个 JAR 文件...`, "准备中，按 ESC 取消");
+    setLoadingProgress(0);
     setStatus("反编译中...");
+    els.btnDecompile.disabled = true;
+    els.btnScan.disabled = true;
 
     try {
       const jarPaths = selected.map((j) => j.path);
-      const result = await api("POST", "/api/decompile", {
+      const result = await streamDecompileProgress({
         jars: jarPaths,
         outputDir: outDir,
-      });
+      }, controller.signal);
 
       state.outputDir = result.outputDir;
       hideLoading();
@@ -342,8 +459,76 @@
       await loadFileTree(result.outputDir);
     } catch (e) {
       hideLoading();
-      toast("反编译失败: " + e.message, "error");
-      setStatus("反编译失败");
+      if (isAbortError(e)) {
+        setStatus("反编译已取消");
+        return;
+      }
+      showTaskError("反编译失败", e);
+    } finally {
+      finishTask(controller);
+      els.btnScan.disabled = false;
+      els.btnDecompile.disabled = !state.jars.some((j) => j.checked);
+    }
+  }
+
+  async function streamDecompileProgress(payload, signal) {
+    const res = await fetch("/api/decompile/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw taskError(data.error || `HTTP ${res.status}`, data.log || "");
+    }
+    if (!res.body) {
+      throw new Error("浏览器不支持读取进度流");
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalResult = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.type === "error") {
+          throw taskError(event.message || "反编译失败", event.log || "");
+        }
+        if (event.type === "done") {
+          finalResult = event.result;
+        }
+        updateDecompileProgress(event);
+      }
+    }
+
+    if (buffer.trim()) {
+      const event = JSON.parse(buffer);
+      if (event.type === "error") throw taskError(event.message || "反编译失败", event.log || "");
+      if (event.type === "done") finalResult = event.result;
+      updateDecompileProgress(event);
+    }
+    if (!finalResult) throw new Error("反编译未返回结果");
+    return finalResult;
+  }
+
+  function updateDecompileProgress(event) {
+    const percent = Number.isFinite(event.percent) ? event.percent : 0;
+    const prefix = `${percent}%`;
+    const detail = [event.detail, event.jar].filter(Boolean).join(" · ");
+    setLoadingProgress(percent);
+    updateLoading(event.message || "反编译中...", detail || prefix);
+    if (event.type === "progress") {
+      setStatus(`${prefix} | ${event.message || "反编译中"}`);
     }
   }
 
@@ -601,7 +786,7 @@
     try {
       const c = await api("GET", "/api/config");
       els.settingJavaPath.placeholder = c.javaPath || "未找到";
-      els.settingCfrPath.placeholder = c.cfrPath || "自动下载";
+      els.settingCfrPath.placeholder = c.cfrPath || "自动识别 Fernflower";
     } catch { /* ignore */ }
   }
 
@@ -646,6 +831,18 @@
     return s.toFixed(i === 0 ? 0 : 1) + " " + u[i];
   }
 
+  function timestampForPath() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
+  function buildDefaultOutputDir(srcDir) {
+    const base = srcDir.replace(/[\\/]+$/, "") + "_decompiled";
+    const sep = srcDir.includes("\\") && !srcDir.includes("/") ? "\\" : "/";
+    return `${base}${sep}${timestampForPath()}`;
+  }
+
   function escapeHtml(str) {
     const d = document.createElement("div");
     d.textContent = str;
@@ -656,6 +853,7 @@
   function init() {
     setupModalClose(els.modalBrowse);
     setupModalClose(els.modalSettings);
+    setupModalClose(els.modalLog);
     setupDragDrop();
     setupResizer();
 
@@ -704,6 +902,7 @@
     // Settings
     els.btnSettings.addEventListener("click", () => { loadConfig(); openModal(els.modalSettings); });
     els.settingsSave.addEventListener("click", saveSettings);
+    els.taskLogClose.addEventListener("click", () => closeModal(els.modalLog));
 
     // Search
     els.btnSearchToggle.addEventListener("click", () => {
@@ -724,6 +923,9 @@
         e.preventDefault();
         if (!els.btnDecompile.disabled) decompileAll();
         else scanDir();
+      }
+      if (e.key === "Escape") {
+        cancelActiveTask(true);
       }
     });
 

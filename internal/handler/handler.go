@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -9,18 +10,28 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/hg0434hongzh0/Jar-Fucker/internal/cfr"
 	"github.com/hg0434hongzh0/Jar-Fucker/internal/jar"
 )
 
 type Handler struct {
-	javaPath string
-	cfrPath  string
+	mu         sync.RWMutex
+	javaPath   string
+	cfrPath    string
+	configPath string
+}
+
+type appConfig struct {
+	JavaPath string `json:"javaPath"`
+	CfrPath  string `json:"cfrPath"`
 }
 
 func New(webFS fs.FS) http.Handler {
-	h := &Handler{}
+	h := &Handler{configPath: ".jar-fucker.json"}
+	h.loadConfig()
 
 	mux := http.NewServeMux()
 
@@ -30,6 +41,7 @@ func New(webFS fs.FS) http.Handler {
 	mux.HandleFunc("POST /api/analyze", h.handleAnalyze)
 	mux.HandleFunc("POST /api/extract", h.handleExtract)
 	mux.HandleFunc("POST /api/decompile", h.handleDecompile)
+	mux.HandleFunc("POST /api/decompile/stream", h.handleDecompileStream)
 	mux.HandleFunc("POST /api/upload", h.handleUpload)
 	mux.HandleFunc("GET /api/tree", h.handleTree)
 	mux.HandleFunc("GET /api/file", h.handleFile)
@@ -47,9 +59,47 @@ func (h *Handler) writeJSON(w http.ResponseWriter, v any) {
 }
 
 func (h *Handler) writeError(w http.ResponseWriter, code int, msg string) {
+	h.writeErrorWithLog(w, code, msg, "")
+}
+
+func (h *Handler) writeErrorWithLog(w http.ResponseWriter, code int, msg, log string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	resp := map[string]string{"error": msg}
+	if strings.TrimSpace(log) != "" {
+		resp["log"] = log
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) loadConfig() {
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		return
+	}
+	var cfg appConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return
+	}
+	h.javaPath = cfg.JavaPath
+	h.cfrPath = cfg.CfrPath
+}
+
+func (h *Handler) saveConfig() error {
+	h.mu.RLock()
+	cfg := appConfig{JavaPath: h.javaPath, CfrPath: h.cfrPath}
+	h.mu.RUnlock()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(h.configPath, data, 0644)
+}
+
+func (h *Handler) getToolConfig() (string, string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.javaPath, h.cfrPath
 }
 
 // POST /api/scan - 扫描目录内所有 JAR 文件
@@ -134,21 +184,132 @@ func (h *Handler) handleDecompile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(req.Jars) == 1 {
-		result, err := cfr.Decompile(req.Jars[0], req.OutputDir, h.javaPath, h.cfrPath, req.FilterPkg)
+		javaPath, cfrPath := h.getToolConfig()
+		result, err := cfr.Decompile(req.Jars[0], req.OutputDir, javaPath, cfrPath, req.FilterPkg)
 		if err != nil {
-			h.writeError(w, 500, err.Error())
+			h.writeErrorWithLog(w, 500, err.Error(), cfr.LogFromError(err))
 			return
 		}
 		h.writeJSON(w, result)
 		return
 	}
 
-	result, err := cfr.DecompileMultiple(req.Jars, req.OutputDir, h.javaPath, h.cfrPath)
+	javaPath, cfrPath := h.getToolConfig()
+	result, err := cfr.DecompileMultiple(req.Jars, req.OutputDir, javaPath, cfrPath, req.FilterPkg)
 	if err != nil {
-		h.writeError(w, 500, err.Error())
+		h.writeErrorWithLog(w, 500, err.Error(), cfr.LogFromError(err))
 		return
 	}
 	h.writeJSON(w, result)
+}
+
+type decompileEvent struct {
+	Type      string      `json:"type"`
+	Message   string      `json:"message,omitempty"`
+	Detail    string      `json:"detail,omitempty"`
+	Current   int         `json:"current,omitempty"`
+	Total     int         `json:"total,omitempty"`
+	Percent   int         `json:"percent,omitempty"`
+	Jar       string      `json:"jar,omitempty"`
+	Result    *cfr.Result `json:"result,omitempty"`
+	JavaFiles int         `json:"javaFiles,omitempty"`
+	Elapsed   string      `json:"elapsed,omitempty"`
+	Log       string      `json:"log,omitempty"`
+}
+
+// POST /api/decompile/stream - 流式返回批量反编译进度
+func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Jars      []string `json:"jars"`
+		OutputDir string   `json:"outputDir"`
+		FilterPkg string   `json:"filterPkg"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, 400, "无效请求")
+		return
+	}
+	if len(req.Jars) == 0 {
+		h.writeError(w, 400, "请提供 JAR 文件列表")
+		return
+	}
+	if req.OutputDir == "" {
+		h.writeError(w, 400, "请提供输出目录")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.writeError(w, 500, "当前服务器不支持进度流")
+		return
+	}
+
+	javaPath, cfrPath := h.getToolConfig()
+	if javaPath == "" {
+		var err error
+		javaPath, err = cfr.FindJava()
+		if err != nil {
+			h.writeError(w, 500, err.Error())
+			return
+		}
+	}
+	if cfrPath == "" {
+		cfrPath = cfr.DefaultCFRPath()
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	enc := json.NewEncoder(w)
+	send := func(event decompileEvent) {
+		_ = enc.Encode(event)
+		flusher.Flush()
+	}
+
+	absOut, _ := filepath.Abs(req.OutputDir)
+	start := time.Now()
+	total := len(req.Jars)
+	totalJava := 0
+
+	send(decompileEvent{Type: "start", Message: "准备反编译", Total: total, Percent: 0})
+	if err := cfr.EnsureDecompilerContext(r.Context(), cfrPath, javaPath); err != nil {
+		send(decompileEvent{Type: "error", Message: err.Error(), Percent: 0, Log: cfr.LogFromError(err)})
+		return
+	}
+
+	for i, jarPath := range req.Jars {
+		jarName := filepath.Base(jarPath)
+		percent := i * 100 / total
+		send(decompileEvent{
+			Type:    "progress",
+			Message: fmt.Sprintf("正在反编译 %s", jarName),
+			Detail:  fmt.Sprintf("%d/%d", i+1, total),
+			Current: i + 1,
+			Total:   total,
+			Percent: percent,
+			Jar:     jarName,
+		})
+
+		outDir := absOut
+		if total > 1 {
+			baseName := strings.TrimSuffix(jarName, filepath.Ext(jarName))
+			outDir = filepath.Join(absOut, baseName)
+		}
+
+		result, err := cfr.DecompileContext(r.Context(), jarPath, outDir, javaPath, cfrPath, req.FilterPkg)
+		if err != nil {
+			send(decompileEvent{Type: "error", Message: fmt.Sprintf("反编译 %s 失败: %v", jarName, err), Current: i + 1, Total: total, Percent: percent, Jar: jarName, Log: cfr.LogFromError(err)})
+			return
+		}
+		totalJava += result.JavaFiles
+		send(decompileEvent{Type: "progress", Message: fmt.Sprintf("已完成 %s", jarName), Current: i + 1, Total: total, Percent: (i + 1) * 100 / total, Jar: jarName, JavaFiles: totalJava})
+	}
+
+	result := &cfr.Result{
+		OutputDir: absOut,
+		JavaFiles: totalJava,
+		Elapsed:   fmt.Sprintf("%.1fs", time.Since(start).Seconds()),
+	}
+	send(decompileEvent{Type: "done", Message: "反编译完成", Total: total, Percent: 100, Result: result, JavaFiles: totalJava, Elapsed: result.Elapsed})
 }
 
 // POST /api/upload - 接收拖拽上传的 JAR 文件
@@ -166,9 +327,11 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	files := r.MultipartForm.File["files"]
 	var saved []jar.JarFile
+	usedNames := make(map[string]int)
 
 	for _, fh := range files {
-		if !strings.HasSuffix(strings.ToLower(fh.Filename), ".jar") {
+		fileName := filepath.Base(fh.Filename)
+		if !strings.HasSuffix(strings.ToLower(fileName), ".jar") {
 			continue
 		}
 
@@ -177,7 +340,8 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		dstPath := filepath.Join(tmpDir, fh.Filename)
+		safeName := uniqueUploadName(fileName, usedNames)
+		dstPath := filepath.Join(tmpDir, safeName)
 		dst, err := os.Create(dstPath)
 		if err != nil {
 			src.Close()
@@ -189,7 +353,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		dst.Close()
 
 		saved = append(saved, jar.JarFile{
-			Name: fh.Filename,
+			Name: safeName,
 			Path: dstPath,
 			Size: fh.Size,
 		})
@@ -200,6 +364,17 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"files":   saved,
 		"total":   len(saved),
 	})
+}
+
+func uniqueUploadName(name string, used map[string]int) string {
+	count := used[name]
+	used[name] = count + 1
+	if count == 0 {
+		return name
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	return fmt.Sprintf("%s-%d%s", base, count+1, ext)
 }
 
 func (h *Handler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
@@ -355,20 +530,20 @@ func (h *Handler) handleBrowse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	javaPath := h.javaPath
+	javaPath, cfrPath := h.getToolConfig()
 	if javaPath == "" {
 		javaPath, _ = cfr.FindJava()
 	}
 
-	cfrPath := h.cfrPath
 	if cfrPath == "" {
 		cfrPath = cfr.DefaultCFRPath()
 	}
 
 	h.writeJSON(w, map[string]string{
-		"javaPath":   javaPath,
-		"cfrPath":    cfrPath,
-		"cfrVersion": cfr.Version,
+		"javaPath":          javaPath,
+		"cfrPath":           cfrPath,
+		"decompilerName":    "Fernflower",
+		"decompilerVersion": cfr.Version,
 	})
 }
 
@@ -382,11 +557,14 @@ func (h *Handler) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.JavaPath != "" {
-		h.javaPath = req.JavaPath
-	}
-	if req.CfrPath != "" {
-		h.cfrPath = req.CfrPath
+	h.mu.Lock()
+	h.javaPath = req.JavaPath
+	h.cfrPath = req.CfrPath
+	h.mu.Unlock()
+
+	if err := h.saveConfig(); err != nil {
+		h.writeError(w, 500, "保存配置失败: "+err.Error())
+		return
 	}
 
 	h.writeJSON(w, map[string]string{"status": "ok"})

@@ -18,8 +18,11 @@ build/
 .DS_Store
 Thumbs.db
 
-# Project - CFR downloaded jars
+# Project - local tool state
+.jar-fucker.json
 /cfr/
+/fernflower-idea-*.zip
+/fernflower-idea-*/
 output/
 *_decompiled/
 *_extracted/

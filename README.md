@@ -1,25 +1,27 @@
 # Jar-Fucker
 
-> 基于 Go 的 JAR 包提取与 CFR 反编译工具 —— 内置 Web 图形界面，单文件即可运行
+> 基于 Go 的 JAR 包提取与 Fernflower 反编译工具 —— 内置 Web 图形界面，单文件即可运行
 
 ## 功能特性
 
 - **图形化界面** — 内嵌 Web UI，深色主题，VS Code 风格布局
-- **一键反编译** — 选择 JAR 文件，自动提取 + CFR 反编译
-- **自动下载 CFR** — 首次使用自动下载 CFR 反编译器
+- **一键反编译** — 选择 JAR 文件，自动提取 + Fernflower 反编译
+- **自动识别 Fernflower** — 支持 `fernflower.jar`、源码 zip 或解压目录
 - **文件浏览器** — 可视化浏览本地文件系统选择 JAR
 - **目录树** — 反编译结果以树形结构展示
 - **语法高亮** — 内置 Java 代码语法高亮查看器
 - **多标签页** — 同时打开多个文件，标签切换
 - **代码搜索** — 在反编译结果中搜索关键词，高亮匹配
 - **JAR 分析** — 查看包结构、文件统计、MANIFEST 信息
+- **任务日志** — 反编译或构建失败时显示 Fernflower/Gradle 错误详情
+- **配置持久化** — Java 与 Fernflower 路径保存到 `.jar-fucker.json`
 - **单文件部署** — 编译后为单个可执行文件，所有资源内嵌
 - **键盘快捷键** — Ctrl+O 浏览 / Ctrl+F 搜索 / Ctrl+Enter 反编译
 
 ## 环境要求
 
 - Go >= 1.22 (编译)
-- Java JDK/JRE (运行 CFR)
+- Java JDK/JRE (运行 Fernflower；源码 zip 首次构建需要 JDK)
 
 ## 快速开始
 
@@ -47,8 +49,8 @@ go build -o jar-fucker .
 ### 2. 反编译
 
 - 点击「反编译」按钮或按 `Ctrl+Enter`
-- 工具会自动下载 CFR (首次)、提取并反编译 JAR 包
-- 结果输出到 `<JAR名>_decompiled/` 目录
+- 工具会使用 Fernflower 提取并反编译 JAR 包
+- 未手动填写输出目录时，结果输出到带时间戳的 `<源目录>_decompiled/<时间戳>/` 目录
 
 ### 3. 浏览源码
 
@@ -62,7 +64,8 @@ go build -o jar-fucker .
 
 ### 5. 设置
 
-- 点击齿轮图标可配置：Java 路径、CFR 路径、输出目录、过滤包名
+- 点击齿轮图标可配置：Java 路径、Fernflower 路径、输出目录、过滤包名
+- 保存后配置会写入当前工作目录的 `.jar-fucker.json`
 
 ## 自定义端口
 
@@ -82,7 +85,7 @@ Jar-Fucker/
 │   ├── jar/
 │   │   └── jar.go           # JAR 分析/提取/搜索
 │   └── cfr/
-│       └── cfr.go           # CFR 下载与反编译
+│       └── cfr.go           # Fernflower 构建与反编译
 ├── web/
 │   ├── index.html           # 前端页面
 │   ├── style.css            # 样式 (Catppuccin 深色主题)

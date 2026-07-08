@@ -812,6 +812,21 @@ kbd {
 .form-group input:focus { border-color: var(--accent); }
 .form-group input::placeholder { color: var(--text-dim); }
 
+.task-log-content {
+  width: 100%;
+  max-height: 55vh;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-crust);
+  color: var(--text-sub);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* Loading */
 #loading-overlay {
   position: fixed;
@@ -841,6 +856,23 @@ kbd {
 
 #loading-text { font-size: 15px; color: var(--text-sub); }
 .loading-sub { font-size: 12px; color: var(--text-dim); }
+
+.loading-progress {
+  width: min(320px, 70vw);
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-surface0);
+  border: 1px solid var(--border);
+}
+
+#loading-progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  transition: width 0.2s ease;
+}
 
 /* Toast */
 #toast-container {
