@@ -110,7 +110,7 @@ go build ./...
 goreleaser release --snapshot --clean
 ```
 
-推送 `v*` 或 `V*` tag 会触发 GitHub Release workflow，并把版本、commit 与构建时间注入二进制。
+推送标准语义版本格式的 `v*` tag（例如 `v2.0.0`）会触发 GitHub Release workflow，并把版本、commit 与构建时间注入二进制。
 
 ## API
 
