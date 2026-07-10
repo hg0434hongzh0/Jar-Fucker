@@ -1,0 +1,53 @@
+version: 2
+
+project_name: jar-fucker
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: jar-fucker
+    main: .
+    binary: jar-fucker
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - >-
+        -s -w
+        -X main.version={{.Version}}
+        -X main.commit={{.ShortCommit}}
+        -X main.buildDate={{.Date}}
+
+archives:
+  - id: release
+    ids:
+      - jar-fucker
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - internal/cfr/assets/FERNFLOWER-LICENSE.txt
+      - internal/cfr/assets/FERNFLOWER-NOTICE.txt
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

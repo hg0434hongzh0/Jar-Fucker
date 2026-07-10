@@ -1,14 +1,22 @@
 package handler
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,20 +26,62 @@ import (
 )
 
 type Handler struct {
-	mu         sync.RWMutex
-	javaPath   string
-	cfrPath    string
-	configPath string
+	mu           sync.RWMutex
+	javaPath     string
+	cfrPath      string
+	configPath   string
+	sessionToken string
+	taskMu       sync.Mutex
+	uploadDirs   sync.Map
 }
+
+type Options struct {
+	SessionToken string
+	ConfigPath   string
+}
+
+const (
+	maxJSONBody                = 1 << 20
+	maxUploadBody              = 1 << 30
+	multipartMemory            = 16 << 20
+	maxUploadedFiles           = 512
+	maxViewerFileBytes         = 5 << 20
+	uploadDirPrefix            = "jar-fucker-upload-"
+	staleUploadMaxAge          = 24 * time.Hour
+	decompileHeartbeatInterval = 2 * time.Second
+)
 
 type appConfig struct {
 	JavaPath string `json:"javaPath"`
 	CfrPath  string `json:"cfrPath"`
 }
 
-func New(webFS fs.FS) http.Handler {
-	h := &Handler{configPath: ".jar-fucker.json"}
+func NewSessionToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("生成启动令牌失败: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func New(webFS fs.FS, option ...Options) http.Handler {
+	opts := Options{}
+	if len(option) > 0 {
+		opts = option[0]
+	}
+	if opts.SessionToken == "" {
+		opts.SessionToken, _ = NewSessionToken()
+	}
+	if opts.ConfigPath == "" {
+		opts.ConfigPath = defaultConfigPath()
+	}
+
+	h := &Handler{
+		configPath:   opts.ConfigPath,
+		sessionToken: opts.SessionToken,
+	}
 	h.loadConfig()
+	h.cleanupStaleUploads()
 
 	mux := http.NewServeMux()
 
@@ -43,14 +93,103 @@ func New(webFS fs.FS) http.Handler {
 	mux.HandleFunc("POST /api/decompile", h.handleDecompile)
 	mux.HandleFunc("POST /api/decompile/stream", h.handleDecompileStream)
 	mux.HandleFunc("POST /api/upload", h.handleUpload)
+	mux.HandleFunc("DELETE /api/upload", h.handleDeleteUpload)
 	mux.HandleFunc("GET /api/tree", h.handleTree)
 	mux.HandleFunc("GET /api/file", h.handleFile)
 	mux.HandleFunc("POST /api/search", h.handleSearch)
 	mux.HandleFunc("GET /api/browse", h.handleBrowse)
 	mux.HandleFunc("GET /api/config", h.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", h.handleSetConfig)
+	mux.HandleFunc("GET /api/session", h.handleSession)
 
-	return mux
+	return h.secure(mux)
+}
+
+func (h *Handler) handleSession(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func defaultConfigPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil || dir == "" {
+		return ".jar-fucker.json"
+	}
+	return filepath.Join(dir, "Jar-Fucker", "config.json")
+}
+
+func (h *Handler) secure(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+
+		if !isLoopbackHost(r.Host) || !sameOriginRequest(r) {
+			h.writeError(w, http.StatusForbidden, "拒绝非本机来源的请求")
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") && !h.validSessionToken(r.Header.Get("X-Jar-Fucker-Token")) {
+			h.writeError(w, http.StatusUnauthorized, "启动令牌无效，请从应用启动页重新打开")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) validSessionToken(token string) bool {
+	if token == "" || h.sessionToken == "" || len(token) != len(h.sessionToken) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(h.sessionToken)) == 1
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if parsed, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host) && isLoopbackHost(u.Host)
+}
+
+func (h *Handler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效请求: "+err.Error())
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		h.writeError(w, http.StatusBadRequest, "请求只能包含一个 JSON 对象")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, v any) {
@@ -73,27 +212,57 @@ func (h *Handler) writeErrorWithLog(w http.ResponseWriter, code int, msg, log st
 }
 
 func (h *Handler) loadConfig() {
-	data, err := os.ReadFile(h.configPath)
-	if err != nil {
+	paths := []string{h.configPath}
+	if filepath.Clean(h.configPath) != filepath.Clean(".jar-fucker.json") {
+		paths = append(paths, ".jar-fucker.json")
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cfg appConfig
+		if json.Unmarshal(data, &cfg) != nil {
+			continue
+		}
+		h.javaPath = strings.TrimSpace(cfg.JavaPath)
+		h.cfrPath = strings.TrimSpace(cfg.CfrPath)
 		return
 	}
-	var cfg appConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return
-	}
-	h.javaPath = cfg.JavaPath
-	h.cfrPath = cfg.CfrPath
 }
 
-func (h *Handler) saveConfig() error {
-	h.mu.RLock()
-	cfg := appConfig{JavaPath: h.javaPath, CfrPath: h.cfrPath}
-	h.mu.RUnlock()
+func writeConfigFile(path string, cfg appConfig) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(h.configPath, data, 0644)
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (h *Handler) getToolConfig() (string, string) {
@@ -107,8 +276,7 @@ func (h *Handler) handleScan(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Dir string `json:"dir"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Dir == "" {
@@ -116,7 +284,7 @@ func (h *Handler) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jars, err := jar.ScanDir(req.Dir)
+	jars, err := jar.ScanDirContext(r.Context(), req.Dir)
 	if err != nil {
 		h.writeError(w, 400, err.Error())
 		return
@@ -135,8 +303,7 @@ func (h *Handler) handleExtract(w http.ResponseWriter, r *http.Request) {
 		Jars      []jar.JarFile `json:"jars"`
 		OutputDir string        `json:"outputDir"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if len(req.Jars) == 0 {
@@ -148,7 +315,7 @@ func (h *Handler) handleExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	total, err := jar.ExtractAll(req.Jars, req.OutputDir)
+	total, err := jar.ExtractAllContext(r.Context(), req.Jars, req.OutputDir)
 	if err != nil {
 		h.writeError(w, 500, err.Error())
 		return
@@ -169,8 +336,7 @@ func (h *Handler) handleDecompile(w http.ResponseWriter, r *http.Request) {
 		OutputDir string   `json:"outputDir"`
 		FilterPkg string   `json:"filterPkg"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -182,10 +348,15 @@ func (h *Handler) handleDecompile(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, 400, "请提供输出目录")
 		return
 	}
+	if !h.taskMu.TryLock() {
+		h.writeError(w, http.StatusConflict, "已有反编译任务正在运行")
+		return
+	}
+	defer h.taskMu.Unlock()
 
 	if len(req.Jars) == 1 {
 		javaPath, cfrPath := h.getToolConfig()
-		result, err := cfr.Decompile(req.Jars[0], req.OutputDir, javaPath, cfrPath, req.FilterPkg)
+		result, err := cfr.DecompileContext(r.Context(), req.Jars[0], req.OutputDir, javaPath, cfrPath, req.FilterPkg)
 		if err != nil {
 			h.writeErrorWithLog(w, 500, err.Error(), cfr.LogFromError(err))
 			return
@@ -195,7 +366,7 @@ func (h *Handler) handleDecompile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	javaPath, cfrPath := h.getToolConfig()
-	result, err := cfr.DecompileMultiple(req.Jars, req.OutputDir, javaPath, cfrPath, req.FilterPkg)
+	result, err := cfr.DecompileMultipleContext(r.Context(), req.Jars, req.OutputDir, javaPath, cfrPath, req.FilterPkg)
 	if err != nil {
 		h.writeErrorWithLog(w, 500, err.Error(), cfr.LogFromError(err))
 		return
@@ -217,6 +388,92 @@ type decompileEvent struct {
 	Log       string      `json:"log,omitempty"`
 }
 
+type decompileOutcome struct {
+	result *cfr.Result
+	err    error
+}
+
+func offerDecompileProgress(ch chan cfr.Progress, update cfr.Progress) {
+	select {
+	case ch <- update:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- update:
+	default:
+	}
+}
+
+func mapDecompileProgress(update cfr.Progress, jarName string, current, total, jarStart, jarEnd int) decompileEvent {
+	localPercent := 0
+	eventType := "phase"
+	message := fmt.Sprintf("正在准备 %s", jarName)
+	detail := fmt.Sprintf("%d/%d", current, total)
+
+	switch update.Phase {
+	case cfr.ProgressExtracting:
+		message = fmt.Sprintf("正在展开 %s", jarName)
+	case cfr.ProgressDecompiling:
+		localPercent = 10
+		message = fmt.Sprintf("Fernflower 正在反编译 %s", jarName)
+		if update.CompletedUnits > 0 {
+			eventType = "progress"
+			completed := update.CompletedUnits
+			if update.ClassFiles > 0 {
+				completed = min(completed, update.ClassFiles)
+				localPercent += completed * 80 / update.ClassFiles
+				detail = fmt.Sprintf("已完成 %d 个编译单元 · 输入 %d 个 class 文件", update.CompletedUnits, update.ClassFiles)
+			} else {
+				detail = fmt.Sprintf("已完成 %d 个编译单元", update.CompletedUnits)
+			}
+			if update.Detail != "" {
+				detail += " · " + update.Detail
+			}
+		}
+	case cfr.ProgressFinalizing:
+		localPercent = 95
+		message = fmt.Sprintf("正在统计 %s 的输出", jarName)
+	}
+
+	localPercent = min(localPercent, 95)
+	percent := jarStart + max(0, jarEnd-jarStart)*localPercent/100
+	return decompileEvent{
+		Type:    eventType,
+		Message: message,
+		Detail:  detail,
+		Current: current,
+		Total:   total,
+		Percent: percent,
+		Jar:     jarName,
+	}
+}
+
+func decompileHeartbeat(update cfr.Progress, jarName string, current, total, percent int, elapsed time.Duration) decompileEvent {
+	detail := fmt.Sprintf("%d/%d · 已运行 %s", current, total, elapsed.Round(time.Second))
+	if update.CompletedUnits > 0 {
+		if update.ClassFiles > 0 {
+			detail = fmt.Sprintf("已完成 %d 个编译单元 · 输入 %d 个 class 文件 · 已运行 %s", update.CompletedUnits, update.ClassFiles, elapsed.Round(time.Second))
+		} else {
+			detail = fmt.Sprintf("已完成 %d 个编译单元 · 已运行 %s", update.CompletedUnits, elapsed.Round(time.Second))
+		}
+	}
+	return decompileEvent{
+		Type:    "heartbeat",
+		Message: fmt.Sprintf("%s 仍在处理中", jarName),
+		Detail:  detail,
+		Current: current,
+		Total:   total,
+		Percent: percent,
+		Jar:     jarName,
+		Elapsed: elapsed.Round(time.Second).String(),
+	}
+}
+
 // POST /api/decompile/stream - 流式返回批量反编译进度
 func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -224,8 +481,7 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 		OutputDir string   `json:"outputDir"`
 		FilterPkg string   `json:"filterPkg"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if len(req.Jars) == 0 {
@@ -236,72 +492,155 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 		h.writeError(w, 400, "请提供输出目录")
 		return
 	}
+	if !h.taskMu.TryLock() {
+		h.writeError(w, http.StatusConflict, "已有反编译任务正在运行")
+		return
+	}
+	defer h.taskMu.Unlock()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		h.writeError(w, 500, "当前服务器不支持进度流")
 		return
 	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	enc := json.NewEncoder(w)
+	responseController := http.NewResponseController(w)
+	send := func(event decompileEvent) bool {
+		if err := enc.Encode(event); err != nil {
+			cancel()
+			return false
+		}
+		if err := responseController.Flush(); err != nil {
+			cancel()
+			return false
+		}
+		return true
+	}
+
+	absOut, err := filepath.Abs(req.OutputDir)
+	if err != nil {
+		_ = send(decompileEvent{Type: "error", Message: "输出目录无效: " + err.Error()})
+		return
+	}
+	start := time.Now()
+	total := len(req.Jars)
+	totalJava := 0
+
+	if !send(decompileEvent{Type: "start", Message: "正在检查运行环境", Total: total, Percent: 0}) {
+		return
+	}
 	javaPath, cfrPath := h.getToolConfig()
 	if javaPath == "" {
-		var err error
+		if !send(decompileEvent{Type: "phase", Message: "正在检测 Java 21+", Total: total, Percent: 2}) {
+			return
+		}
 		javaPath, err = cfr.FindJava()
 		if err != nil {
-			h.writeError(w, 500, err.Error())
+			_ = send(decompileEvent{Type: "error", Message: err.Error(), Percent: 2})
 			return
 		}
 	}
 	if cfrPath == "" {
 		cfrPath = cfr.DefaultCFRPath()
 	}
-
-	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	enc := json.NewEncoder(w)
-	send := func(event decompileEvent) {
-		_ = enc.Encode(event)
-		flusher.Flush()
+	if !send(decompileEvent{Type: "phase", Message: "正在准备 Fernflower", Detail: filepath.Base(cfrPath), Total: total, Percent: 5}) {
+		return
 	}
-
-	absOut, _ := filepath.Abs(req.OutputDir)
-	start := time.Now()
-	total := len(req.Jars)
-	totalJava := 0
-
-	send(decompileEvent{Type: "start", Message: "准备反编译", Total: total, Percent: 0})
-	if err := cfr.EnsureDecompilerContext(r.Context(), cfrPath, javaPath); err != nil {
-		send(decompileEvent{Type: "error", Message: err.Error(), Percent: 0, Log: cfr.LogFromError(err)})
+	if err := cfr.EnsureDecompilerContext(ctx, cfrPath, javaPath); err != nil {
+		_ = send(decompileEvent{Type: "error", Message: err.Error(), Percent: 5, Log: cfr.LogFromError(err)})
 		return
 	}
 
+	usedOutputNames := make(map[string]int)
 	for i, jarPath := range req.Jars {
 		jarName := filepath.Base(jarPath)
-		percent := i * 100 / total
-		send(decompileEvent{
-			Type:    "progress",
-			Message: fmt.Sprintf("正在反编译 %s", jarName),
-			Detail:  fmt.Sprintf("%d/%d", i+1, total),
-			Current: i + 1,
-			Total:   total,
-			Percent: percent,
-			Jar:     jarName,
-		})
+		jarStartPercent := 8 + i*90/total
+		jarEndPercent := 8 + (i+1)*90/total
 
 		outDir := absOut
 		if total > 1 {
 			baseName := strings.TrimSuffix(jarName, filepath.Ext(jarName))
+			key := strings.ToLower(baseName)
+			usedOutputNames[key]++
+			if usedOutputNames[key] > 1 {
+				baseName = fmt.Sprintf("%s-%d", baseName, usedOutputNames[key])
+			}
 			outDir = filepath.Join(absOut, baseName)
 		}
 
-		result, err := cfr.DecompileContext(r.Context(), jarPath, outDir, javaPath, cfrPath, req.FilterPkg)
-		if err != nil {
-			send(decompileEvent{Type: "error", Message: fmt.Sprintf("反编译 %s 失败: %v", jarName, err), Current: i + 1, Total: total, Percent: percent, Jar: jarName, Log: cfr.LogFromError(err)})
+		progressCh := make(chan cfr.Progress, 1)
+		doneCh := make(chan decompileOutcome, 1)
+		jarStarted := time.Now()
+		go func() {
+			result, err := cfr.DecompileContextWithProgress(ctx, jarPath, outDir, javaPath, cfrPath, req.FilterPkg, func(update cfr.Progress) {
+				offerDecompileProgress(progressCh, update)
+			})
+			doneCh <- decompileOutcome{result: result, err: err}
+		}()
+
+		ticker := time.NewTicker(decompileHeartbeatInterval)
+		latestUpdate := cfr.Progress{Phase: cfr.ProgressExtracting}
+		currentPercent := jarStartPercent
+		var outcome decompileOutcome
+		finished := false
+		for !finished {
+			select {
+			case update := <-progressCh:
+				latestUpdate = update
+				event := mapDecompileProgress(update, jarName, i+1, total, jarStartPercent, jarEndPercent)
+				currentPercent = max(currentPercent, event.Percent)
+				event.Percent = currentPercent
+				if !send(event) {
+					ticker.Stop()
+					cancel()
+					<-doneCh
+					return
+				}
+			case <-ticker.C:
+				if !send(decompileHeartbeat(latestUpdate, jarName, i+1, total, currentPercent, time.Since(jarStarted))) {
+					ticker.Stop()
+					cancel()
+					<-doneCh
+					return
+				}
+			case outcome = <-doneCh:
+				finished = true
+			case <-ctx.Done():
+				ticker.Stop()
+				cancel()
+				<-doneCh
+				return
+			}
+		}
+		ticker.Stop()
+
+		select {
+		case update := <-progressCh:
+			latestUpdate = update
+			event := mapDecompileProgress(update, jarName, i+1, total, jarStartPercent, jarEndPercent)
+			currentPercent = max(currentPercent, event.Percent)
+			event.Percent = currentPercent
+			if !send(event) {
+				return
+			}
+		default:
+		}
+		if outcome.err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			_ = send(decompileEvent{Type: "error", Message: fmt.Sprintf("反编译 %s 失败: %v", jarName, outcome.err), Current: i + 1, Total: total, Percent: currentPercent, Jar: jarName, Log: cfr.LogFromError(outcome.err)})
 			return
 		}
-		totalJava += result.JavaFiles
-		send(decompileEvent{Type: "progress", Message: fmt.Sprintf("已完成 %s", jarName), Current: i + 1, Total: total, Percent: (i + 1) * 100 / total, Jar: jarName, JavaFiles: totalJava})
+		totalJava += outcome.result.JavaFiles
+		if !send(decompileEvent{Type: "progress", Message: fmt.Sprintf("已完成 %s", jarName), Current: i + 1, Total: total, Percent: jarEndPercent, Jar: jarName, JavaFiles: totalJava}) {
+			return
+		}
 	}
 
 	result := &cfr.Result{
@@ -309,23 +648,40 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 		JavaFiles: totalJava,
 		Elapsed:   fmt.Sprintf("%.1fs", time.Since(start).Seconds()),
 	}
-	send(decompileEvent{Type: "done", Message: "反编译完成", Total: total, Percent: 100, Result: result, JavaFiles: totalJava, Elapsed: result.Elapsed})
+	_ = send(decompileEvent{Type: "done", Message: "反编译完成", Total: total, Percent: 100, Result: result, JavaFiles: totalJava, Elapsed: result.Elapsed})
 }
 
 // POST /api/upload - 接收拖拽上传的 JAR 文件
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(500 << 20); err != nil {
-		h.writeError(w, 400, "上传解析失败: "+err.Error())
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBody)
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		h.writeError(w, http.StatusRequestEntityTooLarge, "上传解析失败或总大小超过 1 GiB: "+err.Error())
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		h.writeError(w, http.StatusBadRequest, "没有收到文件")
+		return
+	}
+	if len(files) > maxUploadedFiles {
+		h.writeError(w, http.StatusBadRequest, fmt.Sprintf("单次最多上传 %d 个 JAR", maxUploadedFiles))
 		return
 	}
 
-	tmpDir, err := os.MkdirTemp("", "jar-fucker-upload-*")
+	tmpDir, err := os.MkdirTemp("", uploadDirPrefix+"*")
 	if err != nil {
 		h.writeError(w, 500, "无法创建临时目录")
 		return
 	}
+	keepDir := false
+	defer func() {
+		if !keepDir {
+			_ = removeManagedUploadDir(tmpDir)
+		}
+	}()
 
-	files := r.MultipartForm.File["files"]
 	var saved []jar.JarFile
 	usedNames := make(map[string]int)
 
@@ -337,33 +693,126 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		src, err := fh.Open()
 		if err != nil {
-			continue
+			h.writeError(w, http.StatusBadRequest, "无法读取上传文件 "+fileName+": "+err.Error())
+			return
 		}
 
 		safeName := uniqueUploadName(fileName, usedNames)
 		dstPath := filepath.Join(tmpDir, safeName)
-		dst, err := os.Create(dstPath)
+		dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			src.Close()
-			continue
+			h.writeError(w, http.StatusInternalServerError, "无法保存 "+safeName+": "+err.Error())
+			return
 		}
 
-		io.Copy(dst, src)
-		src.Close()
-		dst.Close()
+		written, copyErr := io.Copy(dst, src)
+		srcErr := src.Close()
+		dstErr := dst.Close()
+		if copyErr != nil || srcErr != nil || dstErr != nil {
+			h.writeError(w, http.StatusInternalServerError, "上传文件写入失败: "+safeName)
+			return
+		}
+		if _, err := jar.Analyze(dstPath); err != nil {
+			h.writeError(w, http.StatusBadRequest, safeName+" 不是有效的 JAR: "+err.Error())
+			return
+		}
 
 		saved = append(saved, jar.JarFile{
 			Name: safeName,
 			Path: dstPath,
-			Size: fh.Size,
+			Size: written,
 		})
 	}
+	if len(saved) == 0 {
+		h.writeError(w, http.StatusBadRequest, "没有有效的 .jar 文件")
+		return
+	}
 
+	keepDir = true
+	h.uploadDirs.Store(tmpDir, time.Now())
 	h.writeJSON(w, map[string]any{
-		"tempDir": tmpDir,
-		"files":   saved,
-		"total":   len(saved),
+		"tempDir":            tmpDir,
+		"suggestedOutputDir": suggestedUploadOutputDir(),
+		"files":              saved,
+		"total":              len(saved),
 	})
+}
+
+func suggestedUploadOutputDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.TempDir()
+	}
+	return filepath.Join(home, "Jar-Fucker Output", time.Now().Format("20060102-150405"))
+}
+
+func (h *Handler) handleDeleteUpload(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	if _, ok := h.uploadDirs.Load(dir); !ok {
+		h.writeError(w, http.StatusNotFound, "上传会话不存在")
+		return
+	}
+	if err := removeManagedUploadDir(dir); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "清理上传文件失败: "+err.Error())
+		return
+	}
+	h.uploadDirs.Delete(dir)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) cleanupStaleUploads() {
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleUploadMaxAge)
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), uploadDirPrefix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().Before(cutoff) {
+			_ = removeManagedUploadDir(filepath.Join(os.TempDir(), entry.Name()))
+		}
+	}
+}
+
+func removeManagedUploadDir(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	absTemp, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(absTemp, absDir)
+	if err != nil || rel == "." || filepath.Dir(rel) != "." || !strings.HasPrefix(filepath.Base(rel), uploadDirPrefix) {
+		return fmt.Errorf("拒绝清理非托管目录: %s", absDir)
+	}
+	return os.RemoveAll(absDir)
+}
+
+func (h *Handler) pathIsUploaded(path string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	found := false
+	h.uploadDirs.Range(func(key, _ any) bool {
+		root, ok := key.(string)
+		if !ok {
+			return true
+		}
+		rel, err := filepath.Rel(root, absPath)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func uniqueUploadName(name string, used map[string]int) string {
@@ -381,8 +830,7 @@ func (h *Handler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Path == "" {
@@ -390,7 +838,7 @@ func (h *Handler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := jar.Analyze(req.Path)
+	info, err := jar.AnalyzeContext(r.Context(), req.Path)
 	if err != nil {
 		h.writeError(w, 400, err.Error())
 		return
@@ -405,12 +853,34 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tree, err := jar.BuildTree(root)
+	offset, err := parseNonNegativeQueryInt(r, "offset", 0)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, err := parseNonNegativeQueryInt(r, "limit", jar.DefaultTreePageSize)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	tree, err := jar.ListTreeContext(r.Context(), root, r.URL.Query().Get("path"), offset, limit)
 	if err != nil {
 		h.writeError(w, 400, err.Error())
 		return
 	}
 	h.writeJSON(w, tree)
+}
+
+func parseNonNegativeQueryInt(r *http.Request, name string, fallback int) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s 必须是非负整数", name)
+	}
+	return value, nil
 }
 
 func (h *Handler) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -420,9 +890,28 @@ func (h *Handler) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		h.writeError(w, 404, "文件不存在: "+path)
+		return
+	}
+	if info.Size() > maxViewerFileBytes {
+		h.writeError(w, http.StatusRequestEntityTooLarge, "文件超过 5 MiB，请使用外部编辑器查看")
+		return
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		h.writeError(w, 404, "文件不存在: "+path)
+		return
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxViewerFileBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		h.writeError(w, http.StatusInternalServerError, "读取文件失败: "+path)
+		return
+	}
+	if len(data) > maxViewerFileBytes {
+		h.writeError(w, http.StatusRequestEntityTooLarge, "文件超过 5 MiB，请使用外部编辑器查看")
 		return
 	}
 
@@ -441,15 +930,18 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 		IgnoreCase bool   `json:"ignoreCase"`
 		MaxResults int    `json:"maxResults"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if req.MaxResults <= 0 {
 		req.MaxResults = 100
 	}
+	if strings.TrimSpace(req.Keyword) == "" {
+		h.writeError(w, http.StatusBadRequest, "搜索关键词不能为空")
+		return
+	}
 
-	results, err := jar.Search(req.Dir, req.Keyword, req.IgnoreCase, req.MaxResults)
+	results, err := jar.SearchContext(r.Context(), req.Dir, req.Keyword, req.IgnoreCase, req.MaxResults)
 	if err != nil {
 		h.writeError(w, 500, err.Error())
 		return
@@ -530,20 +1022,25 @@ func (h *Handler) handleBrowse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	javaPath, cfrPath := h.getToolConfig()
-	if javaPath == "" {
-		javaPath, _ = cfr.FindJava()
+	configuredJava, configuredCFR := h.getToolConfig()
+	effectiveJava := configuredJava
+	if effectiveJava == "" {
+		effectiveJava, _ = cfr.FindJava()
+	}
+	effectiveCFR := configuredCFR
+	if effectiveCFR == "" {
+		effectiveCFR = cfr.DefaultCFRPath()
 	}
 
-	if cfrPath == "" {
-		cfrPath = cfr.DefaultCFRPath()
-	}
-
-	h.writeJSON(w, map[string]string{
-		"javaPath":          javaPath,
-		"cfrPath":           cfrPath,
+	h.writeJSON(w, map[string]any{
+		"javaPath":          configuredJava,
+		"cfrPath":           configuredCFR,
+		"effectiveJavaPath": effectiveJava,
+		"effectiveCfrPath":  effectiveCFR,
 		"decompilerName":    "Fernflower",
 		"decompilerVersion": cfr.Version,
+		"configPath":        h.configPath,
+		"ready":             effectiveJava != "" && effectiveCFR != "",
 	})
 }
 
@@ -552,20 +1049,69 @@ func (h *Handler) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		JavaPath string `json:"javaPath"`
 		CfrPath  string `json:"cfrPath"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, 400, "无效请求")
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
+	req.JavaPath = strings.TrimSpace(req.JavaPath)
+	req.CfrPath = strings.TrimSpace(req.CfrPath)
+	if err := validateJavaPath(req.JavaPath); err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.validateDecompilerPath(req.CfrPath); err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg := appConfig{JavaPath: req.JavaPath, CfrPath: req.CfrPath}
 
 	h.mu.Lock()
-	h.javaPath = req.JavaPath
-	h.cfrPath = req.CfrPath
-	h.mu.Unlock()
-
-	if err := h.saveConfig(); err != nil {
+	defer h.mu.Unlock()
+	if err := writeConfigFile(h.configPath, cfg); err != nil {
 		h.writeError(w, 500, "保存配置失败: "+err.Error())
 		return
 	}
+	h.javaPath = cfg.JavaPath
+	h.cfrPath = cfg.CfrPath
 
 	h.writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func validateJavaPath(path string) error {
+	if path == "" {
+		return nil
+	}
+	resolved := path
+	if !strings.ContainsAny(path, `/\\`) {
+		var err error
+		resolved, err = exec.LookPath(path)
+		if err != nil {
+			return fmt.Errorf("Java 可执行文件不存在: %s", path)
+		}
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || info.IsDir() {
+		return fmt.Errorf("Java 可执行文件不存在: %s", path)
+	}
+	return cfr.ValidateJava(resolved)
+}
+
+func (h *Handler) validateDecompilerPath(path string) error {
+	if path == "" {
+		return nil
+	}
+	if h.pathIsUploaded(path) {
+		return fmt.Errorf("不能把待分析的上传 JAR 设为反编译器")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("Fernflower 路径不存在: %s", path)
+	}
+	if info.IsDir() {
+		return nil
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != ".jar" && ext != ".zip" {
+		return fmt.Errorf("Fernflower 只支持 .jar、源码 .zip 或源码目录")
+	}
+	return nil
 }

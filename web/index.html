@@ -1,234 +1,619 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Jar-Fucker — JAR 反编译工具</title>
-  <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
-</head>
-<body>
-  <div id="app">
-    <!-- Title Bar -->
-    <header id="titlebar">
-      <div class="titlebar-left">
-        <span class="logo">☕ Jar-Fucker</span>
-      </div>
-      <div class="titlebar-center">
-        <div class="path-group">
-          <label>源目录</label>
-          <div class="path-input-group">
-            <input type="text" id="source-dir" placeholder="包含 JAR 的文件夹路径 (或直接拖拽到页面)" spellcheck="false">
-            <button id="btn-browse-source" title="浏览">📁</button>
-          </div>
-        </div>
-        <div class="path-group">
-          <label>输出目录</label>
-          <div class="path-input-group">
-            <input type="text" id="output-dir" placeholder="反编译结果输出路径 (留空自动生成)" spellcheck="false">
-            <button id="btn-browse-output" title="浏览">📁</button>
-          </div>
-        </div>
-      </div>
-      <div class="titlebar-right">
-        <button id="btn-scan" class="action-btn" title="扫描目录中的 JAR 文件">
-          ① 扫描
-        </button>
-        <button id="btn-decompile" class="action-btn primary" title="反编译所有已发现的 JAR" disabled>
-          ② 反编译
-        </button>
-        <button id="btn-settings" class="icon-btn" title="设置">⚙</button>
-      </div>
-    </header>
-
-    <!-- Main Content -->
-    <main id="main-content">
-      <!-- Sidebar -->
-      <aside id="sidebar">
-        <!-- JAR List Section -->
-        <div class="sidebar-section" id="jar-list-section">
-          <div class="sidebar-header">
-            <span>JAR 列表</span>
-            <div class="sidebar-actions">
-              <button id="btn-select-all" class="icon-btn small" title="全选/取消全选">☑</button>
-              <span id="jar-count" class="badge">0</span>
-            </div>
-          </div>
-          <div id="jar-list">
-            <div class="empty-state small-empty">
-              <p>拖拽文件夹到页面或输入路径扫描</p>
-            </div>
-          </div>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Jar-Fucker - JAR 工作台</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/style.css" />
+    <script defer src="/vendor/highlight.min.js"></script>
+    <script defer src="/vendor/lucide.min.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div class="brand-group">
+          <button
+            id="btn-sidebar"
+            class="icon-button mobile-only"
+            type="button"
+            aria-label="打开 JAR 队列"
+            aria-controls="sidebar"
+            aria-expanded="false"
+            title="JAR 队列"
+          >
+            <i data-lucide="panel-left"></i>
+          </button>
+          <a class="brand" href="/" aria-label="Jar-Fucker 工作台">
+            <span class="brand-mark" aria-hidden="true"
+              ><i data-lucide="package-search"></i
+            ></span>
+            <span>Jar-Fucker</span>
+          </a>
         </div>
 
-        <!-- Divider -->
-        <div class="sidebar-divider"></div>
-
-        <!-- File Tree / Search Section -->
-        <div class="sidebar-section" id="tree-section">
-          <div class="sidebar-header">
-            <span>反编译结果</span>
-            <div class="sidebar-actions">
-              <button id="btn-search-toggle" class="icon-btn small" title="搜索">🔍</button>
-            </div>
+        <div class="source-command">
+          <label class="sr-only" for="source-dir">源目录</label>
+          <div class="path-control">
+            <i data-lucide="folder-search" aria-hidden="true"></i>
+            <input
+              type="text"
+              id="source-dir"
+              placeholder="包含 JAR 的目录"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button
+              id="btn-browse-source"
+              class="icon-button compact"
+              type="button"
+              aria-label="浏览源目录"
+              title="浏览源目录"
+            >
+              <i data-lucide="folder-open"></i>
+            </button>
           </div>
-          <div id="search-panel" class="hidden">
-            <div class="search-input-group">
-              <input type="text" id="search-keyword" placeholder="搜索关键词..." spellcheck="false">
-              <label class="search-option">
-                <input type="checkbox" id="search-ignore-case"> 忽略大小写
+          <button id="btn-scan" class="button" type="button">
+            <i data-lucide="scan-search"></i>
+            <span>扫描</span>
+          </button>
+        </div>
+
+        <div class="topbar-actions">
+          <button
+            id="btn-task-log"
+            class="icon-button"
+            type="button"
+            aria-label="查看任务日志"
+            title="任务日志"
+            disabled
+          >
+            <i data-lucide="scroll-text"></i>
+          </button>
+          <button
+            id="btn-settings"
+            class="icon-button"
+            type="button"
+            aria-label="打开设置"
+            title="设置"
+          >
+            <i data-lucide="settings-2"></i>
+          </button>
+        </div>
+      </header>
+
+      <button
+        id="sidebar-backdrop"
+        type="button"
+        aria-label="关闭 JAR 队列"
+        tabindex="-1"
+      ></button>
+
+      <div id="app-body">
+        <aside id="sidebar" aria-label="JAR 扫描队列">
+          <section
+            id="queue-panel"
+            class="queue-section"
+            aria-labelledby="queue-title"
+          >
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">扫描队列</p>
+                <h2 id="queue-title">JAR 文件</h2>
+              </div>
+              <div class="panel-actions">
+                <span
+                  id="jar-count"
+                  class="count-badge"
+                  role="status"
+                  aria-label="已选择 0 个，共 0 个"
+                  >0 / 0</span
+                >
+                <button
+                  id="btn-select-all"
+                  class="icon-button compact"
+                  type="button"
+                  aria-label="全选 JAR"
+                  title="全选"
+                  disabled
+                >
+                  <i data-lucide="list-checks"></i>
+                </button>
+                <button
+                  id="btn-close-sidebar"
+                  class="icon-button compact mobile-only"
+                  type="button"
+                  aria-label="关闭 JAR 队列"
+                  title="关闭"
+                >
+                  <i data-lucide="x"></i>
+                </button>
+              </div>
+            </div>
+            <ul id="jar-list" class="queue-list"></ul>
+            <div id="queue-empty" class="empty-panel">
+              <i data-lucide="package-open" aria-hidden="true"></i>
+              <p>队列为空</p>
+            </div>
+          </section>
+
+          <div
+            id="queue-resizer"
+            class="panel-resizer is-horizontal"
+            role="separator"
+            tabindex="0"
+            aria-label="调整队列与分析面板高度"
+            aria-controls="queue-panel jar-inspector"
+            aria-orientation="horizontal"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="50"
+          ></div>
+
+          <section
+            id="jar-inspector"
+            class="inspector-section"
+            aria-labelledby="inspector-title"
+          >
+            <div class="panel-header compact-header">
+              <div>
+                <p class="panel-kicker">当前选中</p>
+                <h2 id="inspector-title">JAR 分析</h2>
+              </div>
+              <button
+                id="btn-refresh-analysis"
+                class="icon-button compact"
+                type="button"
+                aria-label="重新分析当前 JAR"
+                title="重新分析"
+                disabled
+              >
+                <i data-lucide="refresh-cw"></i>
+              </button>
+            </div>
+            <div id="analysis-empty" class="inspector-empty">
+              选择一个 JAR 查看结构
+            </div>
+            <div id="analysis-content" class="analysis-content" hidden>
+              <div class="analysis-heading">
+                <i data-lucide="package" aria-hidden="true"></i>
+                <div>
+                  <p id="analysis-name" class="analysis-name"></p>
+                  <p id="analysis-path" class="analysis-path"></p>
+                </div>
+              </div>
+              <p
+                id="analysis-state"
+                class="inline-state"
+                aria-live="polite"
+              ></p>
+              <dl class="metric-grid">
+                <div>
+                  <dt>文件</dt>
+                  <dd id="analysis-total">-</dd>
+                </div>
+                <div>
+                  <dt>Class</dt>
+                  <dd id="analysis-classes">-</dd>
+                </div>
+                <div>
+                  <dt>资源</dt>
+                  <dd id="analysis-resources">-</dd>
+                </div>
+                <div>
+                  <dt>包</dt>
+                  <dd id="analysis-package-count">-</dd>
+                </div>
+              </dl>
+              <details class="analysis-disclosure">
+                <summary>包列表</summary>
+                <ul id="analysis-packages" class="package-list"></ul>
+              </details>
+              <details class="analysis-disclosure">
+                <summary>MANIFEST.MF</summary>
+                <pre id="analysis-manifest" class="manifest-view"></pre>
+              </details>
+            </div>
+          </section>
+        </aside>
+
+        <div
+          id="sidebar-resizer"
+          class="panel-resizer is-vertical"
+          role="separator"
+          tabindex="0"
+          aria-label="调整 JAR 队列宽度"
+          aria-controls="sidebar main-content"
+          aria-orientation="vertical"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="50"
+        ></div>
+
+        <main id="main-content">
+          <section class="task-workbench" aria-labelledby="task-title">
+            <div class="task-toolbar">
+              <div class="mode-group">
+                <span id="task-title" class="field-label">任务模式</span>
+                <div
+                  class="segmented-control"
+                  role="group"
+                  aria-labelledby="task-title"
+                >
+                  <button id="mode-decompile" type="button" aria-pressed="true">
+                    <i data-lucide="braces"></i>
+                    <span>反编译</span>
+                  </button>
+                  <button id="mode-extract" type="button" aria-pressed="false">
+                    <i data-lucide="archive-restore"></i>
+                    <span>仅解包</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="task-field output-field">
+                <label class="field-label" for="output-dir">输出目录</label>
+                <span class="path-control">
+                  <i data-lucide="folder-output" aria-hidden="true"></i>
+                  <input
+                    type="text"
+                    id="output-dir"
+                    placeholder="留空自动生成"
+                    spellcheck="false"
+                    autocomplete="off"
+                  />
+                  <button
+                    id="btn-browse-output"
+                    class="icon-button compact"
+                    type="button"
+                    aria-label="浏览输出目录"
+                    title="浏览输出目录"
+                  >
+                    <i data-lucide="folder-open"></i>
+                  </button>
+                </span>
+              </div>
+
+              <label id="filter-field" class="task-field filter-field">
+                <span class="field-label">包过滤</span>
+                <span class="input-control">
+                  <i data-lucide="filter" aria-hidden="true"></i>
+                  <input
+                    type="text"
+                    id="filter-package"
+                    placeholder="例如 com.example"
+                    spellcheck="false"
+                    autocomplete="off"
+                  />
+                </span>
               </label>
-            </div>
-            <button id="btn-search" class="action-btn small full-width">搜索</button>
-            <div id="search-results"></div>
-          </div>
-          <div id="file-tree">
-            <div class="empty-state small-empty">
-              <p>反编译后在此浏览源码</p>
-            </div>
-          </div>
-        </div>
-      </aside>
 
-      <!-- Resizer -->
-      <div id="resizer"></div>
+              <button
+                id="btn-run"
+                class="button primary run-button"
+                type="button"
+                disabled
+              >
+                <i data-lucide="play"></i>
+                <span>开始反编译</span>
+              </button>
+            </div>
 
-      <!-- Editor Area -->
-      <section id="editor-area">
-        <div id="tab-bar"></div>
-        <div id="code-viewer">
-          <!-- Welcome / Drop Zone -->
-          <div id="drop-zone" class="welcome-screen">
-            <div class="drop-zone-inner">
-              <div class="drop-icon">📂</div>
-              <h1>拖拽文件夹到此处</h1>
-              <p>自动识别文件夹内所有 JAR 包</p>
-              <div class="drop-divider"><span>或</span></div>
-              <div class="welcome-steps">
-                <div class="step">
-                  <div class="step-num">1</div>
-                  <div class="step-text">在顶部输入包含 JAR 的文件夹路径，点击「扫描」</div>
+            <div
+              id="task-progress"
+              class="task-progress"
+              role="status"
+              aria-live="polite"
+              hidden
+            >
+              <div class="task-progress-icon" aria-hidden="true">
+                <i data-lucide="loader-circle"></i>
+              </div>
+              <div class="task-progress-copy">
+                <div class="task-progress-heading">
+                  <strong id="task-progress-title">准备任务</strong>
+                  <span id="task-progress-percent"></span>
                 </div>
-                <div class="step">
-                  <div class="step-num">2</div>
-                  <div class="step-text">确认 JAR 列表后，点击「反编译」</div>
-                </div>
-                <div class="step">
-                  <div class="step-num">3</div>
-                  <div class="step-text">在左侧文件树中浏览反编译的 Java 源码</div>
+                <progress id="task-progress-bar" max="100"></progress>
+                <p id="task-progress-detail"></p>
+              </div>
+              <button
+                id="btn-task-cancel"
+                class="button danger subtle"
+                type="button"
+              >
+                <i data-lucide="square"></i>
+                <span>取消</span>
+              </button>
+              <button
+                id="btn-task-dismiss"
+                class="icon-button compact"
+                type="button"
+                aria-label="关闭任务状态"
+                title="关闭"
+                hidden
+              >
+                <i data-lucide="x"></i>
+              </button>
+            </div>
+          </section>
+
+          <section class="workspace" aria-label="反编译结果工作区">
+            <aside id="result-pane" aria-label="结果导航">
+              <div class="result-tabs" role="tablist" aria-label="结果视图">
+                <button
+                  id="result-files-tab"
+                  type="button"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="files-panel"
+                  tabindex="0"
+                >
+                  <i data-lucide="files"></i>
+                  <span>文件</span>
+                </button>
+                <button
+                  id="result-search-tab"
+                  type="button"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="search-panel"
+                  tabindex="-1"
+                >
+                  <i data-lucide="search"></i>
+                  <span>搜索</span>
+                </button>
+              </div>
+
+              <div
+                id="files-panel"
+                class="result-panel"
+                role="tabpanel"
+                aria-labelledby="result-files-tab"
+              >
+                <div
+                  id="file-tree"
+                  class="file-tree"
+                  role="tree"
+                  aria-label="结果文件树"
+                ></div>
+                <div id="tree-empty" class="empty-panel compact-empty">
+                  <i data-lucide="folder-tree" aria-hidden="true"></i>
+                  <p>暂无任务结果</p>
                 </div>
               </div>
-              <div class="welcome-shortcut">
-                支持拖拽 <kbd>.jar</kbd> 文件 或 包含 JAR 的文件夹
+
+              <div
+                id="search-panel"
+                class="result-panel search-panel"
+                role="tabpanel"
+                aria-labelledby="result-search-tab"
+                hidden
+              >
+                <form id="search-form" class="search-form">
+                  <label class="sr-only" for="search-keyword">搜索源码</label>
+                  <div class="search-row">
+                    <span class="input-control">
+                      <i data-lucide="search" aria-hidden="true"></i>
+                      <input
+                        type="search"
+                        id="search-keyword"
+                        placeholder="搜索源码"
+                        spellcheck="false"
+                        autocomplete="off"
+                      />
+                    </span>
+                    <button
+                      id="btn-search"
+                      class="icon-button"
+                      type="submit"
+                      aria-label="执行搜索"
+                      title="搜索"
+                    >
+                      <i data-lucide="arrow-right"></i>
+                    </button>
+                  </div>
+                  <label class="check-control">
+                    <input type="checkbox" id="search-ignore-case" />
+                    <span>忽略大小写</span>
+                  </label>
+                </form>
+                <p
+                  id="search-state"
+                  class="inline-state"
+                  aria-live="polite"
+                ></p>
+                <ul id="search-results" class="search-results"></ul>
               </div>
-            </div>
-          </div>
-        </div>
-      </section>
-    </main>
+            </aside>
 
-    <!-- Status Bar -->
-    <footer id="statusbar">
-      <div class="status-left">
-        <span id="status-text">就绪 — 拖拽文件夹或输入路径开始</span>
-      </div>
-      <div class="status-right">
-        <span id="status-jar-info"></span>
-        <span id="status-file-info"></span>
-      </div>
-    </footer>
+            <div
+              id="workspace-resizer"
+              class="panel-resizer is-vertical"
+              role="separator"
+              tabindex="0"
+              aria-label="调整结果导航与源码查看器宽度"
+              aria-controls="result-pane editor-area"
+              aria-orientation="vertical"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="50"
+            ></div>
 
-    <!-- File Browser Modal -->
-    <div id="modal-browse" class="modal hidden">
-      <div class="modal-backdrop"></div>
-      <div class="modal-content modal-large">
-        <div class="modal-header">
-          <h3 id="browse-title">选择文件夹</h3>
-          <button class="modal-close">&times;</button>
-        </div>
-        <div class="modal-body">
-          <div class="browse-path-bar">
-            <button id="browse-up" title="上级目录">⬆</button>
-            <input type="text" id="browse-current-dir" spellcheck="false">
-            <button id="browse-go">前往</button>
-          </div>
-          <div id="browse-list" class="browse-list"></div>
-        </div>
-        <div class="modal-footer">
-          <button id="browse-cancel" class="action-btn">取消</button>
-          <button id="browse-select-dir" class="action-btn primary">选择此目录</button>
-        </div>
+            <section id="editor-area" aria-label="源码查看器">
+              <div
+                id="tab-bar"
+                class="tab-bar"
+                role="tablist"
+                aria-label="打开的文件"
+              ></div>
+              <div id="code-viewer" class="code-viewer" tabindex="0">
+                <div id="editor-empty" class="editor-empty">
+                  <div class="editor-empty-mark">
+                    <i data-lucide="file-code-2"></i>
+                  </div>
+                  <h1>源码工作区</h1>
+                  <p>选择任务结果中的文件</p>
+                </div>
+              </div>
+            </section>
+          </section>
+        </main>
       </div>
+
+      <footer id="statusbar">
+        <span id="status-text" role="status" aria-live="polite">就绪</span>
+        <span id="status-context"></span>
+      </footer>
     </div>
 
-    <!-- Settings Modal -->
-    <div id="modal-settings" class="modal hidden">
-      <div class="modal-backdrop"></div>
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>设置</h3>
-          <button class="modal-close">&times;</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-group">
-            <label>Java 路径</label>
-            <input type="text" id="setting-java-path" placeholder="自动检测" spellcheck="false">
+    <dialog
+      id="browse-dialog"
+      class="app-dialog wide-dialog"
+      aria-labelledby="browse-title"
+    >
+      <div class="dialog-shell">
+        <div class="dialog-header">
+          <div>
+            <p class="panel-kicker">文件系统</p>
+            <h2 id="browse-title">选择目录</h2>
           </div>
-          <div class="form-group">
-            <label>Fernflower 路径</label>
-            <input type="text" id="setting-cfr-path" placeholder="自动识别源码 zip / jar / 解压目录" spellcheck="false">
-          </div>
+          <button
+            class="icon-button dialog-close"
+            type="button"
+            aria-label="关闭目录浏览器"
+            title="关闭"
+          >
+            <i data-lucide="x"></i>
+          </button>
         </div>
-        <div class="modal-footer">
-          <button id="settings-save" class="action-btn primary">保存</button>
+        <div class="dialog-body">
+          <div class="browse-path-row">
+            <button
+              id="browse-up"
+              class="icon-button"
+              type="button"
+              aria-label="上级目录"
+              title="上级目录"
+            >
+              <i data-lucide="corner-left-up"></i>
+            </button>
+            <label class="sr-only" for="browse-current-dir">当前目录</label>
+            <input
+              type="text"
+              id="browse-current-dir"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button id="browse-go" class="button" type="button">前往</button>
+          </div>
+          <p id="browse-state" class="inline-state" aria-live="polite"></p>
+          <ul id="browse-list" class="browse-list"></ul>
+        </div>
+        <div class="dialog-footer">
+          <button class="button dialog-close" type="button">取消</button>
+          <button id="browse-select-dir" class="button primary" type="button">
+            选择此目录
+          </button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <!-- Task Log Modal -->
-    <div id="modal-log" class="modal hidden">
-      <div class="modal-backdrop"></div>
-      <div class="modal-content modal-large">
-        <div class="modal-header">
-          <h3>任务日志</h3>
-          <button class="modal-close">&times;</button>
+    <dialog
+      id="settings-dialog"
+      class="app-dialog"
+      aria-labelledby="settings-title"
+    >
+      <form id="settings-form" class="dialog-shell">
+        <div class="dialog-header">
+          <div>
+            <p class="panel-kicker">运行环境</p>
+            <h2 id="settings-title">工具设置</h2>
+          </div>
+          <button
+            class="icon-button dialog-close"
+            type="button"
+            aria-label="关闭设置"
+            title="关闭"
+          >
+            <i data-lucide="x"></i>
+          </button>
         </div>
-        <div class="modal-body">
+        <div class="dialog-body form-stack">
+          <label class="form-field">
+            <span>Java 路径</span>
+            <input
+              type="text"
+              id="setting-java-path"
+              placeholder="留空自动检测"
+              spellcheck="false"
+              autocomplete="off"
+            />
+          </label>
+          <label class="form-field">
+            <span>Fernflower 路径</span>
+            <input
+              type="text"
+              id="setting-cfr-path"
+              placeholder="留空自动识别"
+              spellcheck="false"
+              autocomplete="off"
+            />
+          </label>
+          <p id="settings-state" class="inline-state" aria-live="polite"></p>
+        </div>
+        <div class="dialog-footer">
+          <button id="settings-reset" class="button" type="button">
+            恢复自动检测
+          </button>
+          <button class="button dialog-close" type="button">取消</button>
+          <button id="settings-save" class="button primary" type="submit">
+            保存
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog
+      id="log-dialog"
+      class="app-dialog wide-dialog"
+      aria-labelledby="log-title"
+    >
+      <div class="dialog-shell">
+        <div class="dialog-header">
+          <div>
+            <p class="panel-kicker">任务诊断</p>
+            <h2 id="log-title">任务日志</h2>
+          </div>
+          <button
+            class="icon-button dialog-close"
+            type="button"
+            aria-label="关闭任务日志"
+            title="关闭"
+          >
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <div class="dialog-body">
           <pre id="task-log-content" class="task-log-content"></pre>
         </div>
-        <div class="modal-footer">
-          <button id="task-log-close" class="action-btn primary">关闭</button>
+        <div class="dialog-footer">
+          <button class="button primary dialog-close" type="button">
+            关闭
+          </button>
         </div>
       </div>
-    </div>
+    </dialog>
 
-    <!-- Loading Overlay -->
-    <div id="loading-overlay" class="hidden">
-      <div class="loading-spinner"></div>
-      <p id="loading-text">处理中...</p>
-      <div id="loading-progress" class="loading-progress hidden">
-        <div id="loading-progress-bar"></div>
+    <div id="drag-overlay" hidden>
+      <div class="drag-target" role="status">
+        <i data-lucide="package-plus" aria-hidden="true"></i>
+        <strong>释放以加入 JAR 队列</strong>
       </div>
-      <p id="loading-percent" class="loading-sub hidden">0%</p>
-      <p id="loading-detail" class="loading-sub"></p>
     </div>
 
-    <!-- Toast Container -->
-    <div id="toast-container"></div>
-  </div>
-
-  <!-- Drag Overlay -->
-  <div id="drag-overlay" class="hidden">
-    <div class="drag-overlay-inner">
-      <div class="drag-overlay-icon">📂</div>
-      <p>释放以添加 JAR 文件</p>
-    </div>
-  </div>
-
-  <script src="/app.js"></script>
-</body>
+    <div id="toast-container" aria-live="polite" aria-atomic="false"></div>
+  </body>
 </html>
