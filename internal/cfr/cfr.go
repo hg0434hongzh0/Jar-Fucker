@@ -46,9 +46,11 @@ var (
 )
 
 type Result struct {
-	OutputDir string `json:"outputDir"`
-	JavaFiles int    `json:"javaFiles"`
-	Elapsed   string `json:"elapsed"`
+	OutputDir     string `json:"outputDir"`
+	JavaFiles     int    `json:"javaFiles"`
+	Elapsed       string `json:"elapsed"`
+	SucceededJars int    `json:"succeededJars,omitempty"`
+	FailedJars    int    `json:"failedJars,omitempty"`
 }
 
 type ProgressPhase string
@@ -1002,8 +1004,9 @@ func extractJarForFernflowerWithStats(ctx context.Context, jarPath, filterPkg st
 		filterPrefix += "/"
 	}
 	options := safezip.Options{
-		Context: ctx,
-		Limits:  safezip.DefaultLimits(),
+		Context:            ctx,
+		Limits:             safezip.DefaultLimits(),
+		SkipDuplicateFiles: true,
 		Include: func(file *zip.File) bool {
 			name := strings.ReplaceAll(file.Name, `\`, "/")
 			return filterPrefix == "" || !strings.HasSuffix(strings.ToLower(name), ".class") || strings.HasPrefix(name, filterPrefix)

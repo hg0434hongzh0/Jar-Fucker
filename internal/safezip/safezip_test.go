@@ -325,6 +325,28 @@ func TestExtractRejectsDuplicatePaths(t *testing.T) {
 	}
 }
 
+func TestExtractCanSkipDuplicateFilesWhenExplicitlyEnabled(t *testing.T) {
+	r := testZipReader(t,
+		testEntry{name: "duplicate.txt", data: "first"},
+		testEntry{name: "duplicate.txt", data: "second"},
+	)
+	out := filepath.Join(t.TempDir(), "output")
+	result, err := ExtractWithOptions(r, out, Options{SkipDuplicateFiles: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Files != 1 {
+		t.Fatalf("files = %d, want 1", result.Files)
+	}
+	data, err := os.ReadFile(filepath.Join(out, "duplicate.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "first" {
+		t.Fatalf("duplicate policy kept %q, want first entry", data)
+	}
+}
+
 func TestExtractPropagatesDestinationErrors(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(dest, []byte("file"), 0600); err != nil {

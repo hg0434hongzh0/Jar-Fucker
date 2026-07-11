@@ -706,7 +706,7 @@ body.is-resizing-vertical * {
 
 .task-toolbar {
   display: grid;
-  grid-template-columns: auto minmax(220px, 1.25fr) minmax(180px, 0.75fr) auto;
+  grid-template-columns: auto minmax(220px, 1.25fr) minmax(180px, 0.75fr) auto auto;
   align-items: end;
   gap: 10px;
   min-height: 70px;
@@ -1926,5 +1926,30 @@ body.is-resizing-vertical * {
     animation-duration: 1ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 1ms !important;
+  }
+}
+
+
+/* VS Code Java audit workspace integration */
+.vscode-button {
+  min-width: 162px;
+  white-space: nowrap;
+}
+
+.vscode-button:not([hidden]) {
+  display: inline-flex;
+}
+
+@media (max-width: 1100px) {
+  .vscode-button {
+    grid-column: 1 / -1;
+    justify-self: end;
+  }
+}
+
+@media (max-width: 760px) {
+  .vscode-button {
+    width: 100%;
+    justify-content: center;
   }
 }

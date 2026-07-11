@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -23,16 +24,18 @@ import (
 
 	"github.com/hg0434hongzh0/Jar-Fucker/internal/cfr"
 	"github.com/hg0434hongzh0/Jar-Fucker/internal/jar"
+	"github.com/hg0434hongzh0/Jar-Fucker/internal/vscodeaudit"
 )
 
 type Handler struct {
-	mu           sync.RWMutex
-	javaPath     string
-	cfrPath      string
-	configPath   string
-	sessionToken string
-	taskMu       sync.Mutex
-	uploadDirs   sync.Map
+	mu             sync.RWMutex
+	javaPath       string
+	cfrPath        string
+	configPath     string
+	sessionToken   string
+	taskMu         sync.Mutex
+	decompileTasks sync.Map
+	uploadDirs     sync.Map
 }
 
 type Options struct {
@@ -42,9 +45,8 @@ type Options struct {
 
 const (
 	maxJSONBody                = 1 << 20
-	maxUploadBody              = 1 << 30
-	multipartMemory            = 16 << 20
-	maxUploadedFiles           = 512
+	maxUploadBody              = 2 << 30
+	maxUploadedFiles           = 4096
 	maxViewerFileBytes         = 5 << 20
 	uploadDirPrefix            = "jar-fucker-upload-"
 	staleUploadMaxAge          = 24 * time.Hour
@@ -92,6 +94,9 @@ func New(webFS fs.FS, option ...Options) http.Handler {
 	mux.HandleFunc("POST /api/extract", h.handleExtract)
 	mux.HandleFunc("POST /api/decompile", h.handleDecompile)
 	mux.HandleFunc("POST /api/decompile/stream", h.handleDecompileStream)
+	mux.HandleFunc("POST /api/decompile/task", h.handleStartDecompileTask)
+	mux.HandleFunc("GET /api/decompile/task", h.handleGetDecompileTask)
+	mux.HandleFunc("DELETE /api/decompile/task", h.handleCancelDecompileTask)
 	mux.HandleFunc("POST /api/upload", h.handleUpload)
 	mux.HandleFunc("DELETE /api/upload", h.handleDeleteUpload)
 	mux.HandleFunc("GET /api/tree", h.handleTree)
@@ -101,12 +106,42 @@ func New(webFS fs.FS, option ...Options) http.Handler {
 	mux.HandleFunc("GET /api/config", h.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", h.handleSetConfig)
 	mux.HandleFunc("GET /api/session", h.handleSession)
+	mux.HandleFunc("POST /api/vscode-workspace", h.handleVSCodeWorkspace)
 
 	return h.secure(mux)
 }
 
 func (h *Handler) handleSession(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handleVSCodeWorkspace(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		OutputDir string   `json:"outputDir"`
+		Jars      []string `json:"jars"`
+		SourceDir string   `json:"sourceDir"`
+		Open      bool     `json:"open"`
+	}
+	if !h.decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := vscodeaudit.Create(vscodeaudit.Options{
+		OutputDir: req.OutputDir,
+		Jars:      req.Jars,
+		SourceDir: req.SourceDir,
+	})
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Open {
+		if err := vscodeaudit.Open(result.WorkspaceFile); err != nil {
+			result.OpenError = err.Error()
+		} else {
+			result.Opened = true
+		}
+	}
+	h.writeJSON(w, result)
 }
 
 func defaultConfigPath() string {
@@ -374,6 +409,80 @@ func (h *Handler) handleDecompile(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, result)
 }
 
+type decompileRequest struct {
+	Jars      []string `json:"jars"`
+	OutputDir string   `json:"outputDir"`
+	FilterPkg string   `json:"filterPkg"`
+}
+
+type backgroundDecompileTask struct {
+	mu        sync.RWMutex
+	id        string
+	status    string
+	event     decompileEvent
+	hasEvent  bool
+	result    *cfr.Result
+	error     string
+	warnings  []string
+	cancel    context.CancelFunc
+	createdAt time.Time
+	updatedAt time.Time
+}
+
+type decompileTaskSnapshot struct {
+	ID        string          `json:"id"`
+	Status    string          `json:"status"`
+	Event     *decompileEvent `json:"event,omitempty"`
+	Result    *cfr.Result     `json:"result,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	Warnings  []string        `json:"warnings,omitempty"`
+	CreatedAt time.Time       `json:"createdAt"`
+	UpdatedAt time.Time       `json:"updatedAt"`
+}
+
+func (task *backgroundDecompileTask) snapshot() decompileTaskSnapshot {
+	task.mu.RLock()
+	defer task.mu.RUnlock()
+	var event *decompileEvent
+	if task.hasEvent {
+		copy := task.event
+		event = &copy
+	}
+	return decompileTaskSnapshot{
+		ID:        task.id,
+		Status:    task.status,
+		Event:     event,
+		Result:    task.result,
+		Error:     task.error,
+		Warnings:  append([]string(nil), task.warnings...),
+		CreatedAt: task.createdAt,
+		UpdatedAt: task.updatedAt,
+	}
+}
+
+func (task *backgroundDecompileTask) send(event decompileEvent) bool {
+	task.mu.Lock()
+	defer task.mu.Unlock()
+	task.event = event
+	task.hasEvent = true
+	task.updatedAt = time.Now()
+	switch event.Type {
+	case "warning":
+		warning := event.Message
+		if event.Detail != "" {
+			warning += ": " + event.Detail
+		}
+		task.warnings = append(task.warnings, warning)
+	case "error":
+		task.status = "error"
+		task.error = event.Message
+	case "done":
+		task.status = "done"
+		task.result = event.Result
+	}
+	return true
+}
+
 type decompileEvent struct {
 	Type      string      `json:"type"`
 	Message   string      `json:"message,omitempty"`
@@ -475,21 +584,23 @@ func decompileHeartbeat(update cfr.Progress, jarName string, current, total, per
 }
 
 // POST /api/decompile/stream - 流式返回批量反编译进度
-func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Jars      []string `json:"jars"`
-		OutputDir string   `json:"outputDir"`
-		FilterPkg string   `json:"filterPkg"`
+func validateDecompileRequest(req decompileRequest) error {
+	if len(req.Jars) == 0 {
+		return errors.New("请提供 JAR 文件列表")
 	}
+	if req.OutputDir == "" {
+		return errors.New("请提供输出目录")
+	}
+	return nil
+}
+
+func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) {
+	var req decompileRequest
 	if !h.decodeJSON(w, r, &req) {
 		return
 	}
-	if len(req.Jars) == 0 {
-		h.writeError(w, 400, "请提供 JAR 文件列表")
-		return
-	}
-	if req.OutputDir == "" {
-		h.writeError(w, 400, "请提供输出目录")
+	if err := validateDecompileRequest(req); err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.taskMu.TryLock() {
@@ -499,7 +610,7 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 	defer h.taskMu.Unlock()
 
 	if _, ok := w.(http.Flusher); !ok {
-		h.writeError(w, 500, "当前服务器不支持进度流")
+		h.writeError(w, http.StatusInternalServerError, "当前服务器不支持进度流")
 		return
 	}
 	ctx, cancel := context.WithCancel(r.Context())
@@ -522,6 +633,12 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 		return true
 	}
 
+	h.runDecompile(ctx, req, send)
+}
+
+func (h *Handler) runDecompile(parent context.Context, req decompileRequest, send func(decompileEvent) bool) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	absOut, err := filepath.Abs(req.OutputDir)
 	if err != nil {
 		_ = send(decompileEvent{Type: "error", Message: "输出目录无效: " + err.Error()})
@@ -530,6 +647,7 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 	start := time.Now()
 	total := len(req.Jars)
 	totalJava := 0
+	failedJars := 0
 
 	if !send(decompileEvent{Type: "start", Message: "正在检查运行环境", Total: total, Percent: 0}) {
 		return
@@ -634,8 +752,11 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 			if ctx.Err() != nil {
 				return
 			}
-			_ = send(decompileEvent{Type: "error", Message: fmt.Sprintf("反编译 %s 失败: %v", jarName, outcome.err), Current: i + 1, Total: total, Percent: currentPercent, Jar: jarName, Log: cfr.LogFromError(outcome.err)})
-			return
+			failedJars++
+			if !send(decompileEvent{Type: "warning", Message: fmt.Sprintf("已跳过 %s（反编译失败）", jarName), Detail: outcome.err.Error(), Current: i + 1, Total: total, Percent: jarEndPercent, Jar: jarName, Log: cfr.LogFromError(outcome.err)}) {
+				return
+			}
+			continue
 		}
 		totalJava += outcome.result.JavaFiles
 		if !send(decompileEvent{Type: "progress", Message: fmt.Sprintf("已完成 %s", jarName), Current: i + 1, Total: total, Percent: jarEndPercent, Jar: jarName, JavaFiles: totalJava}) {
@@ -644,35 +765,123 @@ func (h *Handler) handleDecompileStream(w http.ResponseWriter, r *http.Request) 
 	}
 
 	result := &cfr.Result{
-		OutputDir: absOut,
-		JavaFiles: totalJava,
-		Elapsed:   fmt.Sprintf("%.1fs", time.Since(start).Seconds()),
+		OutputDir:     absOut,
+		JavaFiles:     totalJava,
+		Elapsed:       fmt.Sprintf("%.1fs", time.Since(start).Seconds()),
+		SucceededJars: total - failedJars,
+		FailedJars:    failedJars,
 	}
 	_ = send(decompileEvent{Type: "done", Message: "反编译完成", Total: total, Percent: 100, Result: result, JavaFiles: totalJava, Elapsed: result.Elapsed})
+}
+
+func (h *Handler) handleStartDecompileTask(w http.ResponseWriter, r *http.Request) {
+	var req decompileRequest
+	if !h.decodeJSON(w, r, &req) {
+		return
+	}
+	if err := validateDecompileRequest(req); err != nil {
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.taskMu.TryLock() {
+		h.writeError(w, http.StatusConflict, "已有反编译任务正在运行")
+		return
+	}
+
+	id, err := NewSessionToken()
+	if err != nil {
+		h.taskMu.Unlock()
+		h.writeError(w, http.StatusInternalServerError, "无法创建任务编号")
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Now()
+	task := &backgroundDecompileTask{
+		id:        id,
+		status:    "running",
+		cancel:    cancel,
+		createdAt: now,
+		updatedAt: now,
+	}
+	h.decompileTasks.Store(id, task)
+	h.cleanupFinishedDecompileTasks(now.Add(-24 * time.Hour))
+
+	go func() {
+		defer h.taskMu.Unlock()
+		defer cancel()
+		h.runDecompile(ctx, req, task.send)
+		task.mu.Lock()
+		if task.status == "running" {
+			if ctx.Err() != nil {
+				task.status = "canceled"
+				task.error = "任务已取消"
+			} else {
+				task.status = "error"
+				task.error = "反编译任务意外结束"
+			}
+			task.updatedAt = time.Now()
+		}
+		task.mu.Unlock()
+	}()
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusAccepted)
+	h.writeJSON(w, task.snapshot())
+}
+
+func (h *Handler) handleGetDecompileTask(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	value, ok := h.decompileTasks.Load(id)
+	if !ok {
+		h.writeError(w, http.StatusNotFound, "反编译任务不存在或已过期")
+		return
+	}
+	h.writeJSON(w, value.(*backgroundDecompileTask).snapshot())
+}
+
+func (h *Handler) handleCancelDecompileTask(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	value, ok := h.decompileTasks.Load(id)
+	if !ok {
+		h.writeError(w, http.StatusNotFound, "反编译任务不存在或已过期")
+		return
+	}
+	task := value.(*backgroundDecompileTask)
+	task.mu.RLock()
+	status := task.status
+	cancel := task.cancel
+	task.mu.RUnlock()
+	if status == "running" && cancel != nil {
+		cancel()
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) cleanupFinishedDecompileTasks(cutoff time.Time) {
+	h.decompileTasks.Range(func(key, value any) bool {
+		task := value.(*backgroundDecompileTask)
+		task.mu.RLock()
+		finished := task.status != "running" && task.updatedAt.Before(cutoff)
+		task.mu.RUnlock()
+		if finished {
+			h.decompileTasks.Delete(key)
+		}
+		return true
+	})
 }
 
 // POST /api/upload - 接收拖拽上传的 JAR 文件
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBody)
-	if err := r.ParseMultipartForm(multipartMemory); err != nil {
-		h.writeError(w, http.StatusRequestEntityTooLarge, "上传解析失败或总大小超过 1 GiB: "+err.Error())
-		return
-	}
-	defer r.MultipartForm.RemoveAll()
-
-	files := r.MultipartForm.File["files"]
-	if len(files) == 0 {
-		h.writeError(w, http.StatusBadRequest, "没有收到文件")
-		return
-	}
-	if len(files) > maxUploadedFiles {
-		h.writeError(w, http.StatusBadRequest, fmt.Sprintf("单次最多上传 %d 个 JAR", maxUploadedFiles))
+	reader, err := r.MultipartReader()
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "无法解析上传请求: "+err.Error())
 		return
 	}
 
 	tmpDir, err := os.MkdirTemp("", uploadDirPrefix+"*")
 	if err != nil {
-		h.writeError(w, 500, "无法创建临时目录")
+		h.writeError(w, http.StatusInternalServerError, "无法创建临时目录")
 		return
 	}
 	keepDir := false
@@ -684,37 +893,60 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	var saved []jar.JarFile
 	usedNames := make(map[string]int)
+	receivedFiles := 0
+	jarFiles := 0
 
-	for _, fh := range files {
-		fileName := filepath.Base(fh.Filename)
-		if !strings.HasSuffix(strings.ToLower(fileName), ".jar") {
+	for {
+		part, nextErr := reader.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			h.writeUploadReadError(w, nextErr)
+			return
+		}
+
+		if part.FormName() != "files" || part.FileName() == "" {
+			_ = part.Close()
+			continue
+		}
+		receivedFiles++
+
+		fileName := filepath.Base(part.FileName())
+		if !strings.EqualFold(filepath.Ext(fileName), ".jar") {
+			_ = part.Close()
 			continue
 		}
 
-		src, err := fh.Open()
-		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "无法读取上传文件 "+fileName+": "+err.Error())
+		jarFiles++
+		if jarFiles > maxUploadedFiles {
+			_ = part.Close()
+			h.writeError(w, http.StatusBadRequest, fmt.Sprintf("单次最多导入 %d 个 JAR", maxUploadedFiles))
 			return
 		}
 
 		safeName := uniqueUploadName(fileName, usedNames)
 		dstPath := filepath.Join(tmpDir, safeName)
-		dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
-			src.Close()
-			h.writeError(w, http.StatusInternalServerError, "无法保存 "+safeName+": "+err.Error())
+		dst, openErr := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if openErr != nil {
+			_ = part.Close()
+			h.writeError(w, http.StatusInternalServerError, "无法保存 "+safeName+": "+openErr.Error())
 			return
 		}
 
-		written, copyErr := io.Copy(dst, src)
-		srcErr := src.Close()
+		written, copyErr := io.Copy(dst, part)
+		partErr := part.Close()
 		dstErr := dst.Close()
-		if copyErr != nil || srcErr != nil || dstErr != nil {
+		if copyErr != nil {
+			h.writeUploadReadError(w, copyErr)
+			return
+		}
+		if partErr != nil || dstErr != nil {
 			h.writeError(w, http.StatusInternalServerError, "上传文件写入失败: "+safeName)
 			return
 		}
-		if _, err := jar.Analyze(dstPath); err != nil {
-			h.writeError(w, http.StatusBadRequest, safeName+" 不是有效的 JAR: "+err.Error())
+		if _, analyzeErr := jar.Analyze(dstPath); analyzeErr != nil {
+			h.writeError(w, http.StatusBadRequest, safeName+" 不是有效的 JAR: "+analyzeErr.Error())
 			return
 		}
 
@@ -723,6 +955,11 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			Path: dstPath,
 			Size: written,
 		})
+	}
+
+	if receivedFiles == 0 {
+		h.writeError(w, http.StatusBadRequest, "没有收到文件")
+		return
 	}
 	if len(saved) == 0 {
 		h.writeError(w, http.StatusBadRequest, "没有有效的 .jar 文件")
@@ -737,6 +974,23 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"files":              saved,
 		"total":              len(saved),
 	})
+}
+
+func (h *Handler) writeUploadReadError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		h.writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("上传总大小超过 %s", formatByteLimit(maxUploadBody)))
+		return
+	}
+	h.writeError(w, http.StatusBadRequest, "上传数据读取失败: "+err.Error())
+}
+
+func formatByteLimit(size int64) string {
+	const gib = int64(1 << 30)
+	if size%gib == 0 {
+		return fmt.Sprintf("%d GiB", size/gib)
+	}
+	return fmt.Sprintf("%d 字节", size)
 }
 
 func suggestedUploadOutputDir() string {

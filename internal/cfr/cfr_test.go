@@ -209,6 +209,46 @@ func TestExtractJarForFernflowerCountsNestedArchivesLikeFernflower(t *testing.T)
 	}
 }
 
+func TestExtractJarForFernflowerKeepsFirstDuplicateFile(t *testing.T) {
+	jarPath := filepath.Join(t.TempDir(), "duplicate.jar")
+	file, err := os.Create(jarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := zip.NewWriter(file)
+	for _, content := range []string{"first", "second"} {
+		entry, err := writer.Create("dm/jdbc/b/b/A.class")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, classFiles, err := extractJarForFernflowerWithStats(context.Background(), jarPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(out)
+	if classFiles != 1 {
+		t.Fatalf("class count = %d, want 1", classFiles)
+	}
+	data, err := os.ReadFile(filepath.Join(out, "dm", "jdbc", "b", "b", "A.class"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "first" {
+		t.Fatalf("duplicate policy kept %q, want first entry", data)
+	}
+}
+
 func writeZip(t *testing.T, files map[string]string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fixture.jar")

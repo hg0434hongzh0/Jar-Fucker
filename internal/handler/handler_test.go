@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/fs"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -238,5 +242,186 @@ func TestTreeEndpointReturnsBoundedPage(t *testing.T) {
 	rec = request(t, h, http.MethodGet, "/api/tree?root="+url.QueryEscape(root)+"&offset=-1", "", testToken)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("negative offset status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVSCodeWorkspaceEndpointCreatesJavaAuditWorkspace(t *testing.T) {
+	root := t.TempDir()
+	output := filepath.Join(root, "out")
+	if err := os.MkdirAll(output, 0755); err != nil {
+		t.Fatal(err)
+	}
+	jarPath := filepath.Join(root, "demo.jar")
+	if err := os.WriteFile(jarPath, []byte("jar"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"outputDir": output,
+		"jars":      []string{jarPath},
+		"sourceDir": root,
+		"open":      false,
+	})
+	rec := request(t, testHandler(t), http.MethodPost, "/api/vscode-workspace", string(body), testToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	var result struct {
+		WorkspaceFile string   `json:"workspaceFile"`
+		Libraries     []string `json:"libraries"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(result.WorkspaceFile); err != nil {
+		t.Fatalf("workspace not created: %v", err)
+	}
+	if len(result.Libraries) != 1 {
+		t.Fatalf("libraries = %#v", result.Libraries)
+	}
+}
+
+func buildTestJAR(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	manifest, err := zw.Create("META-INF/MANIFEST.MF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifest.Write([]byte("Manifest-Version: 1.0\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func multipartUploadRequest(t *testing.T, files []struct {
+	name string
+	data []byte
+}) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, file := range files {
+		part, err := writer.CreateFormFile("files", file.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write(file.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", &body)
+	req.Host = "127.0.0.1:9527"
+	req.Header.Set("X-Jar-Fucker-Token", testToken)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
+
+func TestUploadStreamsValidJARsAndIgnoresOtherFiles(t *testing.T) {
+	h := testHandler(t)
+	jarData := buildTestJAR(t)
+	req := multipartUploadRequest(t, []struct {
+		name string
+		data []byte
+	}{
+		{name: "first.jar", data: jarData},
+		{name: "notes.txt", data: []byte("ignored")},
+		{name: "second.JAR", data: jarData},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var response struct {
+		TempDir string        `json:"tempDir"`
+		Files   []jar.JarFile `json:"files"`
+		Total   int           `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Total != 2 || len(response.Files) != 2 {
+		t.Fatalf("response = %+v, want two JARs", response)
+	}
+	for _, file := range response.Files {
+		if _, err := os.Stat(file.Path); err != nil {
+			t.Fatalf("uploaded file %s is unavailable: %v", file.Path, err)
+		}
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/upload?dir="+url.QueryEscape(response.TempDir), nil)
+	deleteReq.Host = "127.0.0.1:9527"
+	deleteReq.Header.Set("X-Jar-Fucker-Token", testToken)
+	deleteRec := httptest.NewRecorder()
+	h.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("cleanup status = %d; body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+}
+
+func TestUploadRejectsMoreThanConfiguredJARLimit(t *testing.T) {
+	h := testHandler(t)
+	jarData := buildTestJAR(t)
+	files := make([]struct {
+		name string
+		data []byte
+	}, maxUploadedFiles+1)
+	for i := range files {
+		files[i].name = fmt.Sprintf("lib-%04d.jar", i)
+		files[i].data = jarData
+	}
+	req := multipartUploadRequest(t, files)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "4096") {
+		t.Fatalf("limit response did not include configured limit: %s", rec.Body.String())
+	}
+}
+
+func TestUploadSizeLimitHasClearError(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	h.writeUploadReadError(rec, &http.MaxBytesError{Limit: maxUploadBody})
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if !strings.Contains(rec.Body.String(), "2 GiB") {
+		t.Fatalf("size-limit response is unclear: %s", rec.Body.String())
+	}
+}
+
+func TestBackgroundDecompileTaskRetainsProgressAcrossRequests(t *testing.T) {
+	now := time.Now()
+	task := &backgroundDecompileTask{
+		id:        "persistent-task",
+		status:    "running",
+		createdAt: now,
+		updatedAt: now,
+	}
+	task.send(decompileEvent{Type: "warning", Message: "已跳过 broken.jar", Percent: 50})
+	first := task.snapshot()
+	if first.Status != "running" || len(first.Warnings) != 1 || first.Event == nil {
+		t.Fatalf("running snapshot = %+v", first)
+	}
+
+	result := &cfr.Result{OutputDir: t.TempDir(), JavaFiles: 12, SucceededJars: 1, FailedJars: 1}
+	task.send(decompileEvent{Type: "done", Message: "反编译完成", Percent: 100, Result: result})
+	finished := task.snapshot()
+	if finished.Status != "done" || finished.Result == nil || finished.Result.FailedJars != 1 {
+		t.Fatalf("finished snapshot = %+v", finished)
+	}
+	if len(finished.Warnings) != 1 {
+		t.Fatalf("warnings were not retained: %+v", finished.Warnings)
 	}
 }

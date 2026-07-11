@@ -41,6 +41,9 @@ type Options struct {
 	Limits  Limits
 	Include func(*zip.File) bool
 	Context context.Context
+	// SkipDuplicateFiles keeps the first validated entry for an exact duplicate
+	// path. File/directory collisions and all other unsafe paths remain errors.
+	SkipDuplicateFiles bool
 }
 
 type Result struct {
@@ -109,7 +112,7 @@ func ExtractWithOptions(r *zip.Reader, destDir string, options Options) (Result,
 	if err != nil {
 		return Result{}, err
 	}
-	entries, err := prepareEntries(ctx, r, limits)
+	entries, err := prepareEntries(ctx, r, limits, options.SkipDuplicateFiles)
 	if err != nil {
 		return Result{}, err
 	}
@@ -194,7 +197,7 @@ func normalizeLimits(limits Limits) (Limits, error) {
 	return limits, nil
 }
 
-func prepareEntries(ctx context.Context, r *zip.Reader, limits Limits) ([]preparedEntry, error) {
+func prepareEntries(ctx context.Context, r *zip.Reader, limits Limits, skipDuplicateFiles bool) ([]preparedEntry, error) {
 	if len(r.File) > limits.MaxEntries {
 		return nil, fmt.Errorf("%w: entries %d exceed %d", ErrLimitExceeded, len(r.File), limits.MaxEntries)
 	}
@@ -227,8 +230,14 @@ func prepareEntries(ctx context.Context, r *zip.Reader, limits Limits) ([]prepar
 		}
 
 		key := archiveKey(name)
-		if _, exists := kinds[key]; exists {
-			return nil, fmt.Errorf("%w: duplicate path %q", ErrUnsafePath, file.Name)
+		if existingIsDir, exists := kinds[key]; exists {
+			if !skipDuplicateFiles || existingIsDir != isDir {
+				return nil, fmt.Errorf("%w: duplicate path %q", ErrUnsafePath, file.Name)
+			}
+			// Some vendor JARs contain the same file more than once. For
+			// decompiler staging, keeping the first validated entry is safe and
+			// deterministic; file/directory collisions remain forbidden.
+			continue
 		}
 		kinds[key] = isDir
 

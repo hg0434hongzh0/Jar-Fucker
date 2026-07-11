@@ -3,6 +3,7 @@
 
   const TOKEN_KEY = "jar-fucker-launch-token";
   const TOKEN_CHANNEL = "jar-fucker-session-v1";
+  const DECOMPILE_TASK_KEY = "jar-fucker-decompile-task-v1";
   const SESSION_EXPIRED_MESSAGE =
     "服务会话已更新，请使用程序打开的最新启动页重新连接";
   const CODE_LINE_HEIGHT = 21;
@@ -15,6 +16,10 @@
   const MAX_SEARCH_MARKS = 20;
   const LAYOUT_STORAGE_KEY = "jar-fucker-layout-v1";
   const RESIZE_KEYBOARD_STEP = 16;
+  const MAX_UPLOAD_FILES = 4096;
+  const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+  const LARGE_UPLOAD_FILES = 512;
+  const LARGE_UPLOAD_BYTES = 1024 * 1024 * 1024;
 
   let launchToken = readStoredLaunchToken();
   let tokenChannel = null;
@@ -27,6 +32,8 @@
     jars: [],
     scanSession: null,
     outputDir: null,
+    lastTaskJars: [],
+    lastTaskSourceDir: "",
     resultSessionId: 0,
     mode: "decompile",
     activeJarPath: null,
@@ -372,6 +379,7 @@
     els.btnSettings.disabled = locked;
     els.btnSelectAll.disabled = locked || state.jars.length === 0;
     els.btnRun.disabled = locked || selectedJars().length === 0;
+    els.btnOpenVSCode.disabled = locked || !state.outputDir;
     $$("input[type='checkbox']", els.jarList).forEach((input) => {
       input.disabled = locked;
     });
@@ -384,7 +392,7 @@
     }
 
     const controller = new AbortController();
-    state.activeTask = { label, controller };
+    state.activeTask = { label, controller, taskId: null, warningCount: 0 };
     const progressIcon = $(".task-progress-icon", els.taskProgress);
     progressIcon.replaceChildren(createIcon("loader-circle"));
     refreshIcons();
@@ -458,14 +466,19 @@
 
   function cancelActiveTask() {
     if (!state.activeTask) return false;
-    const { controller } = state.activeTask;
-    if (!controller.signal.aborted) controller.abort();
+    const { controller, taskId } = state.activeTask;
     els.btnTaskCancel.disabled = true;
     updateTask(controller, {
       title: "正在取消",
       detail: "等待当前操作停止",
       indeterminate: true,
     });
+    if (taskId) {
+      void api("DELETE", `/api/decompile/task?id=${encodeURIComponent(taskId)}`)
+        .catch((error) => toast(error.message || "取消任务失败", "error"));
+    } else if (!controller.signal.aborted) {
+      controller.abort();
+    }
     return true;
   }
 
@@ -686,6 +699,9 @@
     if (state.treeController) state.treeController.abort();
     state.treeController = null;
     state.outputDir = null;
+    state.lastTaskJars = [];
+    state.lastTaskSourceDir = "";
+    els.btnOpenVSCode.hidden = true;
     state.resultSessionId += 1;
     state.tabs = [];
     state.activeTab = null;
@@ -827,14 +843,16 @@
     try {
       let result;
       if (isDecompile) {
-        result = await streamDecompileProgress(
-          {
-            jars: selected.map((jar) => jar.path),
-            outputDir,
-            filterPkg: els.filterPackage.value.trim(),
-          },
-          controller,
-        );
+        const payload = {
+          jars: selected.map((jar) => jar.path),
+          outputDir,
+          filterPkg: els.filterPackage.value.trim(),
+        };
+        result = await runPersistentDecompileTask(payload, controller, {
+          outputDir,
+          jars: payload.jars,
+          sourceDir: state.scanSession?.sourceDir || "",
+        });
       } else {
         result = await api(
           "POST",
@@ -852,6 +870,9 @@
       }
 
       state.outputDir = result.outputDir || outputDir;
+      state.lastTaskJars = selected.map((jar) => jar.path);
+      state.lastTaskSourceDir = state.scanSession?.sourceDir || "";
+      els.btnOpenVSCode.hidden = !isDecompile;
       els.outputDir.value = state.outputDir;
       updateTask(controller, {
         title: "正在加载结果",
@@ -860,18 +881,18 @@
       });
       await loadFileTree(state.outputDir, controller.signal);
 
+      const failedJars = Number(result.failedJars) || 0;
       const resultDetail = isDecompile
-        ? `${result.javaFiles || 0} 个 Java 文件${result.elapsed ? ` · ${result.elapsed}` : ""}`
+        ? `${result.javaFiles || 0} 个 Java 文件${failedJars ? ` · 跳过 ${failedJars} 个失败 JAR` : ""}${result.elapsed ? ` · ${result.elapsed}` : ""}`
         : `${result.totalFiles || 0} 个文件 · ${result.jarCount || selected.length} 个 JAR`;
-      settleTask(
-        controller,
-        "success",
-        isDecompile ? "反编译完成" : "解包完成",
-        resultDetail,
-        100,
-      );
-      setStatus(isDecompile ? "反编译完成" : "解包完成", state.outputDir);
-      toast(isDecompile ? "反编译完成" : "解包完成", "success");
+      const completedTitle = isDecompile && failedJars
+        ? "反编译完成（部分 JAR 已跳过）"
+        : isDecompile
+          ? "反编译完成"
+          : "解包完成";
+      settleTask(controller, "success", completedTitle, resultDetail, 100);
+      setStatus(completedTitle, state.outputDir);
+      toast(completedTitle, failedJars ? "error" : "success");
     } catch (error) {
       if (isAbortError(error)) {
         settleTask(
@@ -888,6 +909,170 @@
         `${isDecompile ? "反编译" : "解包"}失败`,
         error,
       );
+    }
+  }
+
+  async function openInVSCode() {
+    if (!state.outputDir || state.lastTaskJars.length === 0 || state.activeTask) return;
+    els.btnOpenVSCode.disabled = true;
+    setStatus("正在生成 VS Code Java 审计工作区", state.outputDir);
+    try {
+      const result = await api("POST", "/api/vscode-workspace", {
+        outputDir: state.outputDir,
+        jars: state.lastTaskJars,
+        sourceDir: state.lastTaskSourceDir,
+        open: true,
+      });
+      if (result.opened) {
+        toast(`已用 VS Code 打开，加载 ${result.libraries?.length || 0} 个 JAR`, "success");
+        setStatus("VS Code 审计工作区已打开", result.workspaceFile || "");
+      } else {
+        toast(result.openError || "工作区已生成，请手动打开", "error");
+        setStatus("VS Code 工作区已生成", result.workspaceFile || "");
+      }
+    } catch (error) {
+      toast(error.message || "生成 VS Code 工作区失败", "error");
+      setStatus("生成 VS Code 工作区失败");
+    } finally {
+      els.btnOpenVSCode.disabled = state.sessionExpired;
+    }
+  }
+
+  function savePersistentDecompileTask(value) {
+    sessionStorage.setItem(DECOMPILE_TASK_KEY, JSON.stringify(value));
+  }
+
+  function clearPersistentDecompileTask() {
+    sessionStorage.removeItem(DECOMPILE_TASK_KEY);
+  }
+
+  function waitForTaskPoll(ms, signal) {
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("任务已取消", "AbortError"));
+      };
+      const timer = window.setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  function consumePersistentTaskSnapshot(snapshot, controller) {
+    const event = snapshot?.event || {};
+    const warnings = Array.isArray(snapshot?.warnings) ? snapshot.warnings : [];
+    if (state.activeTask?.controller === controller) {
+      const previousCount = state.activeTask.warningCount || 0;
+      if (warnings.length > previousCount) {
+        warnings.slice(previousCount).forEach((warning) => toast(warning, "error"));
+        state.activeTask.warningCount = warnings.length;
+        saveTaskLog(warnings.join("\n"));
+      }
+    }
+    if (event.log) {
+      const combined = [warnings.join("\n"), event.log].filter(Boolean).join("\n\n");
+      saveTaskLog(combined);
+    }
+    const details = [event.detail, event.jar].filter(Boolean).join(" · ");
+    const indeterminate =
+      event.type === "heartbeat" || !Number.isFinite(event.percent);
+    updateTask(controller, {
+      title: event.message || "正在反编译",
+      detail: details || "后台任务运行中，刷新页面后可自动恢复",
+      percent: indeterminate ? undefined : event.percent,
+      indeterminate,
+    });
+    if (event.message) setStatus(event.message, details);
+  }
+
+  async function pollPersistentDecompileTask(taskId, controller) {
+    while (true) {
+      const snapshot = await api(
+        "GET",
+        `/api/decompile/task?id=${encodeURIComponent(taskId)}`,
+        null,
+        { signal: controller.signal },
+      );
+      consumePersistentTaskSnapshot(snapshot, controller);
+      if (snapshot.status === "done") {
+        clearPersistentDecompileTask();
+        return snapshot.result || {};
+      }
+      if (snapshot.status === "error") {
+        clearPersistentDecompileTask();
+        throw taskError(snapshot.error || "反编译失败");
+      }
+      if (snapshot.status === "canceled") {
+        clearPersistentDecompileTask();
+        throw new DOMException("任务已取消", "AbortError");
+      }
+      await waitForTaskPoll(750, controller.signal);
+    }
+  }
+
+  async function runPersistentDecompileTask(payload, controller, metadata) {
+    const snapshot = await api("POST", "/api/decompile/task", payload, {
+      signal: controller.signal,
+    });
+    if (!snapshot.id) throw new Error("反编译服务未返回任务编号");
+    if (state.activeTask?.controller === controller)
+      state.activeTask.taskId = snapshot.id;
+    savePersistentDecompileTask({
+      taskId: snapshot.id,
+      ...metadata,
+      startedAt: Date.now(),
+    });
+    consumePersistentTaskSnapshot(snapshot, controller);
+    return pollPersistentDecompileTask(snapshot.id, controller);
+  }
+
+  async function resumePersistentDecompileTask() {
+    let saved;
+    try {
+      saved = JSON.parse(sessionStorage.getItem(DECOMPILE_TASK_KEY) || "null");
+    } catch {
+      clearPersistentDecompileTask();
+      return;
+    }
+    if (!saved?.taskId || state.activeTask) return;
+
+    const controller = startTask("正在恢复反编译进度", {
+      detail: "正在连接后台任务",
+      percent: 0,
+    });
+    if (!controller) return;
+    state.activeTask.taskId = saved.taskId;
+    try {
+      const result = await pollPersistentDecompileTask(saved.taskId, controller);
+      state.outputDir = result.outputDir || saved.outputDir || "";
+      state.lastTaskJars = Array.isArray(saved.jars) ? saved.jars : [];
+      state.lastTaskSourceDir = saved.sourceDir || "";
+      els.outputDir.value = state.outputDir;
+      els.btnOpenVSCode.hidden = false;
+      updateTask(controller, {
+        title: "正在加载结果",
+        detail: state.outputDir,
+        percent: 100,
+      });
+      await loadFileTree(state.outputDir, controller.signal);
+      const failedJars = Number(result.failedJars) || 0;
+      const title = failedJars
+        ? "反编译完成（部分 JAR 已跳过）"
+        : "反编译完成";
+      const detail = `${result.javaFiles || 0} 个 Java 文件${failedJars ? ` · 跳过 ${failedJars} 个失败 JAR` : ""}${result.elapsed ? ` · ${result.elapsed}` : ""}`;
+      settleTask(controller, "success", title, detail, 100);
+      setStatus(title, state.outputDir);
+      toast("已恢复后台任务进度和结果", "success");
+    } catch (error) {
+      if (error?.message?.includes("不存在或已过期"))
+        clearPersistentDecompileTask();
+      if (isAbortError(error)) {
+        settleTask(controller, "idle", "反编译已取消", "");
+        return;
+      }
+      showTaskError(controller, "恢复反编译任务失败", error);
     }
   }
 
@@ -916,6 +1101,7 @@
       if (event.type === "error") {
         throw taskError(event.message || "反编译失败", event.log || "");
       }
+      if (event.type === "warning") toast(event.message || "已跳过失败的 JAR", "error");
       if (event.log) saveTaskLog(event.log);
       if (event.type === "done") finalResult = event.result || null;
 
@@ -1917,9 +2103,32 @@
         return;
       }
 
+      const totalBytes = jarFiles.reduce(
+        (sum, file) => sum + (Number(file.size) || 0),
+        0,
+      );
+      if (jarFiles.length > MAX_UPLOAD_FILES) {
+        throw taskError(
+          `该目录包含 ${jarFiles.length} 个 JAR，超过单次导入上限 ${MAX_UPLOAD_FILES} 个。请在顶部“源目录”输入本机路径后点击扫描。`,
+        );
+      }
+      if (totalBytes >= MAX_UPLOAD_BYTES) {
+        throw taskError(
+          `JAR 总大小为 ${formatSize(totalBytes)}，超过拖拽导入上限 2 GiB。请在顶部“源目录”输入本机路径后点击扫描。`,
+        );
+      }
+      if (
+        jarFiles.length > LARGE_UPLOAD_FILES ||
+        totalBytes > LARGE_UPLOAD_BYTES
+      ) {
+        toast(
+          `大型目录：${jarFiles.length} 个 JAR，共 ${formatSize(totalBytes)}。拖拽会复制文件；本机目录建议直接填写“源目录”扫描。`,
+        );
+      }
+
       updateTask(controller, {
         title: "正在上传",
-        detail: `${jarFiles.length} 个 JAR`,
+        detail: `${jarFiles.length} 个 JAR · ${formatSize(totalBytes)}`,
       });
       const formData = new FormData();
       jarFiles.forEach((file) => formData.append("files", file));
@@ -2363,6 +2572,7 @@
       btnBrowseOutput: $("#btn-browse-output"),
       btnScan: $("#btn-scan"),
       btnRun: $("#btn-run"),
+      btnOpenVSCode: $("#btn-open-vscode"),
       modeDecompile: $("#mode-decompile"),
       modeExtract: $("#mode-extract"),
       btnSettings: $("#btn-settings"),
@@ -2484,6 +2694,7 @@
     els.modeDecompile.addEventListener("click", () => setMode("decompile"));
     els.modeExtract.addEventListener("click", () => setMode("extract"));
     els.btnRun.addEventListener("click", runSelectedTask);
+    els.btnOpenVSCode.addEventListener("click", openInVSCode);
     els.btnTaskCancel.addEventListener("click", cancelActiveTask);
     els.btnTaskDismiss.addEventListener("click", () => {
       els.taskProgress.hidden = true;
@@ -2550,6 +2761,7 @@
     renderAnalysisEmpty();
     saveTaskLog("");
     refreshIcons();
+    void resumePersistentDecompileTask();
   }
 
   document.addEventListener("DOMContentLoaded", init);
